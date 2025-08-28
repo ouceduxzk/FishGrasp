@@ -28,12 +28,23 @@ from tqdm import tqdm
 from PIL import Image
 
 # 导入现有模块的功能
-from seg import init_models, process_image_for_mask
+from seg import init_models# process_image_cv2
 from mask_to_3d import mask_to_3d_pointcloud, save_pointcloud, load_camera_intrinsics
 from realsense_capture import setup_realsense, depth_to_pointcloud, save_pointcloud_to_file
 
+# 追加自定义模块搜索路径（手眼标定目录）
+_extra_paths = [
+    "/home/ai/AI_perception/hand_eye_calibrate",
+]
+for _p in _extra_paths:
+    try:
+        if os.path.isdir(_p) and _p not in sys.path:
+            sys.path.insert(0, _p)
+    except Exception:
+        pass
+
 class RealtimeSegmentation3D:
-    def __init__(self, output_dir, device="cpu", save_pointcloud=True, intrinsics_file=None):
+    def __init__(self, output_dir, device="cpu", save_pointcloud=True, intrinsics_file=None, hand_eye_file=None):
         """
         初始化实时分割和3D点云生成器
         
@@ -46,6 +57,7 @@ class RealtimeSegmentation3D:
         self.output_dir = output_dir
         self.device = device
         self.save_pointcloud = save_pointcloud
+        self.hand_eye_transform = None  # 4x4 齐次矩阵，相机坐标→夹爪坐标
         
         # 创建输出目录
         self.rgb_dir = os.path.join(output_dir, "rgb")
@@ -84,8 +96,39 @@ class RealtimeSegmentation3D:
         # 帧计数器
         self.frame_count = 0
         self.start_time = time.time()
+
+        # 加载手眼标定矩阵（可选）
+        if hand_eye_file is not None and os.path.exists(hand_eye_file):
+            try:
+                mat = np.load(hand_eye_file)
+                if mat.shape == (4, 4):
+                    self.hand_eye_transform = mat.astype(np.float32)
+                    print("已加载手眼标定矩阵 (相机→夹爪):")
+                    print(self.hand_eye_transform)
+                else:
+                    print(f"hand_eye_file 格式不正确，期望(4,4)，实际{mat.shape}，忽略。")
+            except Exception as e:
+                print(f"加载手眼标定矩阵失败: {e}")
+        # 若未加载到，则使用硬编码的R、t（相机→夹爪）
+        if self.hand_eye_transform is None:
+            R_default = np.array([
+                [-0.99462885,  0.07149648,  0.07484454],
+                [-0.06962775, -0.99719970,  0.02728984],
+                [ 0.07658608,  0.02193200,  0.99682173]
+            ], dtype=np.float32)
+            t_default = np.array([[0.0247092], [0.09912939], [-0.25357213]], dtype=np.float32)
+            self.hand_eye_transform = np.eye(4, dtype=np.float32)
+            self.hand_eye_transform[:3, :3] = R_default
+            self.hand_eye_transform[:3, 3:4] = t_default
+            print("使用硬编码手眼标定矩阵 (相机→夹爪):")
+            print(self.hand_eye_transform)
         
         print("初始化完成！")
+
+
+        import jkrc 
+        robot = jkrc.RC("192.168.80.116")
+        robot.login()   
     
     def capture_frames(self):
         """
@@ -110,9 +153,9 @@ class RealtimeSegmentation3D:
             if not color_frame or not depth_frame:
                 return None, None, False
             
-            # 转换为numpy数组
+            # 转换为numpy数组（RealSense配置为bgr8，因此这里直接得到BGR格式，适用于OpenCV）
             color_image = np.asanyarray(color_frame.get_data())
-            
+
             # 获取深度数据
             height, width = depth_frame.get_height(), depth_frame.get_width()
             depth_image = np.zeros((height, width), dtype=np.uint16)
@@ -129,13 +172,93 @@ class RealtimeSegmentation3D:
             print(f"捕获帧时出错: {e}")
             return None, None, False
     
+    def detect_and_segment_and_dump(self, color_image):
+        """
+        本地完成检测->落盘->分割->落盘，返回用于显示的单通道uint8掩码（0/255）。
+        无检测时返回None。
+        """
+        # 检测
+        boxes = self._detect_boxes(color_image)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        base_name = f"frame_{self.frame_count:06d}_{timestamp}"
+        det_vis = color_image.copy()
+        for idx, (x1, y1, x2, y2) in enumerate(boxes):
+            cv2.rectangle(det_vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            crop = color_image[y1:y2, x1:x2]
+            if crop.size > 0:
+                cv2.imwrite(os.path.join(self.detection_dir, f"{base_name}_det_{idx}.png"), crop)
+        if len(boxes) > 0:
+            cv2.imwrite(os.path.join(self.detection_dir, f"{base_name}_dino_detection.png"), det_vis)
+
+        if not boxes:
+            print("未检测到目标，跳过分割。")
+            return None, None
+
+        # 分割（SAM）
+        try:
+            image_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
+            self.sam_predictor.set_image(image_rgb)
+            boxes_tensor = torch.tensor([[x1, y1, x2, y2] for (x1, y1, x2, y2) in boxes], device=self.device)
+            transformed_boxes = self.sam_predictor.transform.apply_boxes_torch(boxes_tensor, image_rgb.shape[:2])
+
+            masks, scores, logits = self.sam_predictor.predict_torch(
+                point_coords=None,
+                point_labels=None,
+                boxes=transformed_boxes,
+                multimask_output=False
+            )
+
+            # 为每个目标分别保存掩码（全图与裁剪）以及裁剪可视化
+            per_object_masks = []
+            for idx in range(masks.shape[0]):
+                m_bool = masks[idx][0].cpu().numpy().astype(np.uint8)
+                m_u8 = m_bool * 255
+                x1, y1, x2, y2 = boxes[idx]
+                # 全图掩码
+                mask_full_path = os.path.join(self.segmentation_dir, f"{base_name}_obj{idx}_mask.png")
+                cv2.imwrite(mask_full_path, m_u8)
+                # 裁剪掩码
+                mask_crop = m_u8[y1:y2, x1:x2]
+                if mask_crop.size > 0:
+                    mask_crop_path = os.path.join(self.segmentation_dir, f"{base_name}_obj{idx}_mask_crop.png")
+                    cv2.imwrite(mask_crop_path, mask_crop)
+                # 裁剪可视化
+                crop = color_image[y1:y2, x1:x2]
+                if crop.size > 0 and mask_crop.size > 0:
+                    overlay = np.zeros_like(crop)
+                    overlay[mask_crop > 0] = [0, 255, 0]
+                    vis_crop = cv2.addWeighted(crop, 1.0, overlay, 0.4, 0)
+                    vis_crop_path = os.path.join(self.segmentation_dir, f"{base_name}_obj{idx}_mask_crop_vis.png")
+                    cv2.imwrite(vis_crop_path, vis_crop)
+                per_object_masks.append(m_u8)
+
+            # 合并掩码并保存整体可视化
+            combined = np.zeros_like(per_object_masks[0], dtype=np.uint8)
+            for m_u8 in per_object_masks:
+                combined = np.maximum(combined, m_u8)
+            mask_np = combined
+
+            mask_path = os.path.join(self.segmentation_dir, f"{base_name}_mask.png")
+            cv2.imwrite(mask_path, mask_np)
+
+            colored = np.zeros_like(color_image)
+            colored[mask_np > 0] = [0, 255, 0]
+            vis = cv2.addWeighted(color_image, 1.0, colored, 0.4, 0)
+            vis_path = os.path.join(self.segmentation_dir, f"{base_name}_mask_vis.png")
+            cv2.imwrite(vis_path, vis)
+
+            return mask_np, base_name
+        except Exception as e:
+            print(f"分割时出错: {e}")
+            return None, None
+
     def _detect_boxes(self, color_image):
         """
         使用与 seg.py 相同的方式进行检测，返回bbox列表
         """
-        # 转换为PIL图像
+        # 转换为PIL图像（与 seg.py 一致）
         image_pil = Image.fromarray(cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB))
-        text_prompt = "fish crab "
+        text_prompt = "fish. crab. marine animal"
         inputs = self.processor(images=image_pil, text=text_prompt, return_tensors="pt").to(self.device)
         with torch.no_grad():
             outputs = self.grounding_dino_model(**inputs)
@@ -144,10 +267,13 @@ class RealtimeSegmentation3D:
             outputs,
             inputs.input_ids,
             text_threshold=0.25,
-            target_sizes=[(h, w)]
+            # 与 seg.py 相同的尺寸传入方式
+            target_sizes=[image_pil.size[::-1]]
         )
         result = results[0]
         boxes = []
+        print("\n检测结果详情:")
+        print(f"检测到的目标数量: {len(result['boxes'])}")
         if len(result["boxes"]) == 0:
             return boxes
         for box in result["boxes"]:
@@ -180,23 +306,7 @@ class RealtimeSegmentation3D:
             print(f"已保存 {saved} 个检测裁剪到: {self.detection_dir}")
         return saved
 
-    def segment_person(self, color_image):
-        """
-        仅做检测+分割（不落盘），使用 seg.py 的内存接口。
-        返回: mask(bool ndarray) 或 None, True/False
-        """
-        try:
-            mask = process_image_for_mask(
-                self.sam_predictor,
-                self.grounding_dino_model,
-                self.processor,
-                color_image,
-                self.device
-            )
-            return mask, True
-        except Exception as e:
-            print(f"分割时出错: {e}")
-            return None, False
+
     
     def generate_pointcloud(self, color_image, depth_image, mask):
         """
@@ -231,6 +341,25 @@ class RealtimeSegmentation3D:
         except Exception as e:
             print(f"生成点云时出错: {e}")
             return np.array([]), np.array([])
+
+    def apply_hand_eye_transform(self, points):
+        """
+        将点云从相机系转换到夹爪系，使用 self.hand_eye_transform (4x4)。
+        旋转矩阵：
+            [[-0.99462885  0.07149648  0.07484454]
+            [-0.06962775 -0.9971997   0.02728984]
+            [ 0.07658608  0.021932    0.99682173]]
+            平移向量：
+            [[ 0.0247092 ]
+            [ 0.09912939]
+            [-0.25357213]]
+        """
+        if self.hand_eye_transform is None or points.size == 0:
+            return points
+        ones = np.ones((points.shape[0], 1), dtype=np.float32)
+        homo = np.hstack([points.astype(np.float32), ones])  # (N,4)
+        transformed = (self.hand_eye_transform @ homo.T).T  # (N,4)
+        return transformed[:, :3]
     
     def save_results(self, color_image, depth_image, mask, points, colors):
         """
@@ -334,31 +463,43 @@ class RealtimeSegmentation3D:
                 color_image, depth_image, success = self.capture_frames()
                 if not success:
                     continue
+
+                # 检测 + 分割 + 落盘
+                mask_vis, base_name = self.detect_and_segment_and_dump(color_image)
+
+                # # 可视化颜色与深度
+                # valid_depth = depth_image > 0
+                # if valid_depth.any():
+                #     depth_min = depth_image[valid_depth].min()
+                #     depth_max = depth_image[valid_depth].max()
+                #     depth_normalized = np.zeros_like(depth_image, dtype=np.uint8)
+                #     if depth_max > depth_min:
+                #         depth_normalized[valid_depth] = ((depth_image[valid_depth] - depth_min) / (depth_max - depth_min) * 255).astype(np.uint8)
+                #     depth_colormap = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
+                # else:
+                #     depth_colormap = np.zeros((depth_image.shape[0], depth_image.shape[1], 3), dtype=np.uint8)
+
+                # display_size = (640, 480)
+                # color_display = cv2.resize(color_image, display_size)
+                # depth_display = cv2.resize(depth_colormap, display_size)
+                # combined = np.hstack((color_display, depth_display))
+                # cv2.putText(combined, f"Frame: {self.frame_count}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                #v2.imshow('Realtime Color | Depth', combined)
+
+                # 根据掩码生成3D点云并保存（可选应用手眼标定）
+                if mask_vis is not None and base_name is not None and self.save_pointcloud:
+                    mask_bool = (mask_vis > 0)
+                    points, colors = self.generate_pointcloud(color_image, depth_image, mask_bool)
+                    if len(points) > 0:
+                        # 应用手眼变换：相机→夹爪
+                        points_out = self.apply_hand_eye_transform(points)
+                        pointcloud_path = os.path.join(self.pointcloud_dir, f"{base_name}_pointcloud.ply")
+                        save_pointcloud_to_file(points_out, colors, pointcloud_path)
                 
-                # 分割（使用seg.py接口）
-                mask = process_image_for_mask(self.sam_predictor, self.grounding_dino_model, self.processor, color_image, self.device)
-                
-                # 保存检测裁剪
-                self.dump_detections(color_image)
-                
-                # 显示预览
-                if show_preview:
-                    self._show_preview(color_image, depth_image, mask)
-                
-                # 更新计数器
-                self.frame_count += 1
-                
-                # 检查是否达到最大帧数
-                if max_frames and self.frame_count >= max_frames:
-                    print(f"已达到最大帧数 {max_frames}")
-                    break
-                
-                # 检查按键
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    print("用户按 'q' 键停止")
-                    break
-                
+
+                # apply the transformation matrix to the pointcloud\
+
+
         except KeyboardInterrupt:
             print("\n用户中断处理")
         except Exception as e:
@@ -391,6 +532,8 @@ def main():
                       help='不显示预览窗口')
     parser.add_argument('--intrinsics_file', type=str, default=None,
                       help='相机内参JSON文件路径')
+    parser.add_argument('--hand_eye_file', type=str, default=None,
+                      help='手眼标定4x4齐次矩阵的.npy文件路径（相机→夹爪）')
     
     args = parser.parse_args()
     
@@ -400,7 +543,8 @@ def main():
             output_dir=args.output_dir,
             device=args.device,
             save_pointcloud=args.save_pointcloud,
-            intrinsics_file=args.intrinsics_file
+            intrinsics_file=args.intrinsics_file,
+            hand_eye_file=args.hand_eye_file
         )
         
         # 运行实时处理
