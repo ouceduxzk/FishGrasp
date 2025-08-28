@@ -30,6 +30,15 @@ def load_camera_intrinsics(intrinsics_file=None):
     
     Returns:
         fx, fy, cx, cy: 相机内参
+
+        calibrated matrix : 
+        内参矩阵:
+            [[590.76452559   0.         340.14099624]
+            [  0.         586.5565107  258.7094336 ]
+            [  0.           0.           1.        ]]
+            畸变系数:
+            [[ 0.03286813  0.5244697   0.00568441  0.002797   -1.83198928]]
+
     """
     if intrinsics_file and os.path.exists(intrinsics_file):
         with open(intrinsics_file, 'r') as f:
