@@ -62,6 +62,82 @@ def init_models(device="cpu"):
     
     return sam_predictor, model, processor
 
+def process_image_for_mask(sam_predictor, grounding_dino_model, processor, image, device="cpu"):
+    """
+    处理单张图像并返回掩码（不保存文件）
+    
+    Args:
+        sam_predictor: SAM预测器
+        grounding_dino_model: Grounding DINO模型
+        processor: Grounding DINO处理器
+        image: 输入图像cv2    
+        device: 运行设备
+    
+    Returns:
+        mask: 分割掩码，如果没有检测到目标则返回None
+    """
+    # 读取图像
+    if image is None:
+        print(f"错误：无法读取图像: ")
+        return None
+    
+    # 转换为PIL图像
+    image_pil = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    
+    # 准备文本标签
+    text_prompt = "fish crab "
+    
+    # 处理输入
+    inputs = processor(images=image_pil, text=text_prompt, return_tensors="pt").to(device)
+    
+    # 进行检测
+    with torch.no_grad():
+        outputs = grounding_dino_model(**inputs)
+    
+    # 后处理检测结果
+    results = processor.post_process_grounded_object_detection(
+        outputs,
+        inputs.input_ids,
+        text_threshold=0.25,
+        target_sizes=[image_pil.size[::-1]]
+    )
+    
+    result = results[0]
+    
+    # 打印详细的检测结果
+    print("\n检测结果详情:")
+    print(f"检测到的目标数量: {len(result['boxes'])}")
+    
+    # 转换为RGB
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    
+    # 设置图像
+    sam_predictor.set_image(image_rgb)
+    
+    # 使用检测框作为提示
+    boxes = torch.tensor([box.tolist() for box in result["boxes"]], device=device)
+
+    print(f"boxes: {boxes}")
+    transformed_boxes = sam_predictor.transform.apply_boxes_torch(boxes, image_rgb.shape[:2])
+    
+    # 预测掩码
+    masks, scores, logits = sam_predictor.predict_torch(
+        point_coords=None,
+        point_labels=None,
+        boxes=transformed_boxes,
+        multimask_output=False
+    )
+    
+    # 合并所有掩码
+    combined_mask = torch.zeros_like(masks[0][0], dtype=torch.bool)
+    for mask in masks:
+        combined_mask = torch.logical_or(combined_mask, mask[0])
+    
+    # 转换为numpy数组
+    combined_mask = combined_mask.cpu().numpy()
+    
+    return combined_mask
+
 def process_image(sam_predictor, grounding_dino_model, processor, image_path, output_dir, device="cpu"):
     """
     处理单张图像
@@ -76,6 +152,11 @@ def process_image(sam_predictor, grounding_dino_model, processor, image_path, ou
     """
     # 读取图像
     image = cv2.imread(image_path)
+    process_image_cv2(sam_predictor, grounding_dino_model, processor, image, output_dir, device)
+
+
+
+def process_image_cv2(sam_predictor, grounding_dino_model, processor, image, output_dir, device="cpu"):
     if image is None:
         print(f"错误：无法读取图像: {image_path}")
         return
