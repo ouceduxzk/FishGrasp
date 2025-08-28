@@ -127,8 +127,8 @@ class RealtimeSegmentation3D:
 
 
         import jkrc 
-        robot = jkrc.RC("192.168.80.116")
-        robot.login()   
+        self.robot = jkrc.RC("192.168.80.116")
+        self.robot.login()   
     
     def capture_frames(self):
         """
@@ -305,7 +305,6 @@ class RealtimeSegmentation3D:
         if saved:
             print(f"已保存 {saved} 个检测裁剪到: {self.detection_dir}")
         return saved
-
 
     
     def generate_pointcloud(self, color_image, depth_image, mask):
@@ -496,8 +495,25 @@ class RealtimeSegmentation3D:
                         pointcloud_path = os.path.join(self.pointcloud_dir, f"{base_name}_pointcloud.ply")
                         save_pointcloud_to_file(points_out, colors, pointcloud_path)
                 
+                # don't forget to transform the units, the point cloud is in meter, but robot
+                # control would like to be in mm. 
 
+                print("Step1 : 准备抓取")
+                object_x = points_out[0] * 1000
                 # apply the transformation matrix to the pointcloud\
+                target_pos = [ object_x, object_y, object_z , 0, 0, 0]
+                self.robot.set_digital_output(0, 0, 1) 
+                self.robot.linear_move(target_pos, 1, True, 20)
+                self.robot.set_digital_output(0, 0, 0) 
+
+                # once grasp move the robot back to the liao pan position 
+                print("Step2 : 抓取成功，准备落盘")
+                target_pos = [ 0, 0, 30 , 0, 0, 0]
+                self.robot.linear_move(target_pos, 1, True, 20)
+                self.robot.set_digital_output(0, 0, 0) 
+                print("Step3 : 落盘成功， 回到初始位置")
+
+
 
 
         except KeyboardInterrupt:
