@@ -52,12 +52,12 @@ class RealtimeSegmentation3D:
             output_dir: 输出目录
             device: 运行设备 (cpu/cuda)
             save_pointcloud: 是否保存3D点云
-            intrinsics_file: 相机内参文件路径
+            intrinsics_file: 相机内参JSON文件路径
+            hand_eye_file: 手眼标定4x4齐次矩阵的.npy文件路径（相机→夹爪）
         """
         self.output_dir = output_dir
         self.device = device
         self.save_pointcloud = save_pointcloud
-        self.hand_eye_transform = None  # 4x4 齐次矩阵，相机坐标→夹爪坐标
         
         # 创建输出目录
         self.rgb_dir = os.path.join(output_dir, "rgb")
@@ -96,8 +96,9 @@ class RealtimeSegmentation3D:
         # 帧计数器
         self.frame_count = 0
         self.start_time = time.time()
-
+        
         # 加载手眼标定矩阵（可选）
+        self.hand_eye_transform = None  # 4x4 齐次矩阵，相机坐标→夹爪坐标
         if hand_eye_file is not None and os.path.exists(hand_eye_file):
             try:
                 mat = np.load(hand_eye_file)
@@ -112,11 +113,11 @@ class RealtimeSegmentation3D:
         # 若未加载到，则使用硬编码的R、t（相机→夹爪）
         if self.hand_eye_transform is None:
             R_default = np.array([
-                [-0.99462885,  0.07149648,  0.07484454],
-                [-0.06962775, -0.99719970,  0.02728984],
-                [ 0.07658608,  0.02193200,  0.99682173]
+                [-0.99679381,  0.05832427,  0.05477565],
+                [-0.05664780, -0.99789158,  0.03167684],
+                [ 0.05650769,  0.02847236,  0.99799610]
             ], dtype=np.float32)
-            t_default = np.array([[0.0247092], [0.09912939], [-0.25357213]], dtype=np.float32)
+            t_default = np.array([[0.02108376], [0.08418409], [-0.25094157]], dtype=np.float32)
             self.hand_eye_transform = np.eye(4, dtype=np.float32)
             self.hand_eye_transform[:3, :3] = R_default
             self.hand_eye_transform[:3, 3:4] = t_default
@@ -266,7 +267,7 @@ class RealtimeSegmentation3D:
         results = self.processor.post_process_grounded_object_detection(
             outputs,
             inputs.input_ids,
-            text_threshold=0.25,
+            text_threshold=0.3,
             # 与 seg.py 相同的尺寸传入方式
             target_sizes=[image_pil.size[::-1]]
         )
@@ -276,13 +277,29 @@ class RealtimeSegmentation3D:
         print(f"检测到的目标数量: {len(result['boxes'])}")
         if len(result["boxes"]) == 0:
             return boxes
+        
+        # 过滤边界框：面积必须大于1000像素，并选择最大的一个
+        valid_boxes = []
         for box in result["boxes"]:
             x1, y1, x2, y2 = [int(c) for c in box.tolist()]
             x1 = max(0, min(x1, w - 1))
             y1 = max(0, min(y1, h - 1))
             x2 = max(0, min(x2, w - 1))
             y2 = max(0, min(y2, h - 1))
-            boxes.append((x1, y1, x2, y2))
+            
+            # 计算边界框面积
+            area = (x2 - x1) * (y2 - y1)
+            if area > 1000:  # 面积过滤
+                valid_boxes.append(((x1, y1, x2, y2), area))
+        
+        if valid_boxes:
+            # 选择面积最小的边界框
+            smallest_box = min(valid_boxes, key=lambda x: x[1])
+            boxes.append(smallest_box[0])
+            print(f"选择最小边界框，面积: {smallest_box[1]} 像素")
+        else:
+            print("没有满足面积要求的边界框")
+        
         return boxes
     
     def dump_detections(self, color_image):
@@ -359,6 +376,66 @@ class RealtimeSegmentation3D:
         homo = np.hstack([points.astype(np.float32), ones])  # (N,4)
         transformed = (self.hand_eye_transform @ homo.T).T  # (N,4)
         return transformed[:, :3]
+
+    def calculate_pointcloud_bbox(self, points):
+        """
+        计算点云的边界框信息，用于高度和姿态估计
+        
+        Args:
+            points: 点云坐标 (N, 3)
+            
+        Returns:
+            bbox_info: 字典包含中心点、尺寸、边界框等
+        """
+        if points.size == 0:
+            return None
+            
+        # 计算边界框
+        min_coords = np.min(points, axis=0)  # [min_x, min_y, min_z]
+        max_coords = np.max(points, axis=0)  # [max_x, max_y, max_z]
+        
+        # 计算中心点
+        center = (min_coords + max_coords) / 2.0  # [center_x, center_y, center_z]
+        
+        # 计算尺寸
+        dimensions = max_coords - min_coords  # [width, height, depth]
+        
+        # 计算高度（z方向）
+        height = dimensions[2]  # z方向的高度
+        
+        # 计算8个角点
+        corners = []
+        for x in [min_coords[0], max_coords[0]]:
+            for y in [min_coords[1], max_coords[1]]:
+                for z in [min_coords[2], max_coords[2]]:
+                    corners.append([x, y, z])
+        corners = np.array(corners)
+        
+        # 计算点云的主方向（PCA）
+        try:
+            from sklearn.decomposition import PCA
+            pca = PCA(n_components=3)
+            pca.fit(points)
+            principal_axes = pca.components_  # 主方向向量
+            explained_variance = pca.explained_variance_ratio_  # 解释方差比例
+        except ImportError:
+            print("sklearn未安装，跳过PCA姿态估计")
+            principal_axes = np.eye(3)
+            explained_variance = [1.0, 0.0, 0.0]
+        
+        bbox_info = {
+            'center': center,
+            'dimensions': dimensions,
+            'height': height,
+            'min_coords': min_coords,
+            'max_coords': max_coords,
+            'corners': corners,
+            'principal_axes': principal_axes,
+            'explained_variance': explained_variance,
+            'num_points': len(points)
+        }
+        
+        return bbox_info
     
     def save_results(self, color_image, depth_image, mask, points, colors):
         """
@@ -402,48 +479,49 @@ class RealtimeSegmentation3D:
         
         print(f"已保存第 {self.frame_count} 帧结果")
     
-    def _show_preview(self, color_image, depth_image, mask):
+    def show_preview(self, color_image, depth_image, mask):
+        """
+        在一个窗口中显示RGB、深度图和分割结果
+        """
         # 创建深度可视化
         valid_depth = depth_image > 0
         if valid_depth.any():
             depth_min = depth_image[valid_depth].min()
             depth_max = depth_image[valid_depth].max()
             depth_normalized = np.zeros_like(depth_image, dtype=np.uint8)
-            depth_normalized[valid_depth] = ((depth_image[valid_depth] - depth_min) / (depth_max - depth_min) * 255).astype(np.uint8)
+            if depth_max > depth_min:
+                depth_normalized[valid_depth] = ((depth_image[valid_depth] - depth_min) / (depth_max - depth_min) * 255).astype(np.uint8)
             depth_colormap = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
         else:
             depth_colormap = np.zeros((depth_image.shape[0], depth_image.shape[1], 3), dtype=np.uint8)
         
-        # 创建掩码可视化
+        # 创建分割可视化
         if mask is not None:
-            mask_vis = np.zeros_like(color_image)
-            mask_vis[mask] = [0, 255, 0]
-            mask_vis = cv2.addWeighted(color_image, 0.7, mask_vis, 0.3, 0)
+            # 将掩码转换为彩色图像
+            mask_colored = np.zeros_like(color_image)
+            mask_colored[mask > 0] = [0, 255, 0]  # 绿色掩码
+            # 叠加到原图上
+            segmentation_vis = cv2.addWeighted(color_image, 0.7, mask_colored, 0.3, 0)
         else:
-            mask_vis = color_image.copy()
-        
-        # 绘制检测框到 det_vis
-        det_vis = color_image.copy()
-        for (x1, y1, x2, y2) in self._detect_boxes(color_image):
-            cv2.rectangle(det_vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            segmentation_vis = color_image.copy()
         
         # 调整图像大小
-        display_size = (320, 240)
+        display_size = (400, 300)
         color_display = cv2.resize(color_image, display_size)
         depth_display = cv2.resize(depth_colormap, display_size)
-        mask_display = cv2.resize(mask_vis, display_size)
-        det_display = cv2.resize(det_vis, display_size)
+        seg_display = cv2.resize(segmentation_vis, display_size)
         
-        # 四宫格
-        top_row = np.hstack((color_display, depth_display))
-        bottom_row = np.hstack((mask_display, det_display))
-        combined = np.vstack((top_row, bottom_row))
+        # 水平拼接三个图像
+        combined = np.hstack((color_display, depth_display, seg_display))
         
-        # 添加文字
-        cv2.putText(combined, f"Frame: {self.frame_count}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        cv2.putText(combined, "RGB | Depth | Seg | Det", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        # 添加标签
+        cv2.putText(combined, "RGB", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(combined, "Depth", (410, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(combined, "Segmentation", (810, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(combined, f"Frame: {self.frame_count}", (10, combined.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
-        cv2.imshow('Realtime Segmentation 3D', combined)
+        cv2.imshow('RGB | Depth | Segmentation', combined)
+
     
     def run_realtime(self, max_frames=None, show_preview=True):
         """
@@ -456,62 +534,116 @@ class RealtimeSegmentation3D:
         print("开始实时处理...")
         print("按 'q' 键停止")
         
+
+        tcp_ok, original_tcp = self.robot.get_tcp_position()
+
         try:
             while True:
                 # 捕获帧
                 color_image, depth_image, success = self.capture_frames()
                 if not success:
                     continue
+                
+                # 跳过前3帧，让相机稳定
+                if self.frame_count < 10:
+                    print(f"跳过第 {self.frame_count + 1} 帧，等待相机稳定...")
+                    self.frame_count += 1
+                    continue
 
                 # 检测 + 分割 + 落盘
                 mask_vis, base_name = self.detect_and_segment_and_dump(color_image)
+                
+                # 保存RGB和深度图像
+                if base_name is not None:
+                    # 保存RGB图像
+                    rgb_path = os.path.join(self.rgb_dir, f"{base_name}.png")
+                    cv2.imwrite(rgb_path, color_image)
+                    
+                    # 保存深度图像（原始16位）
+                    depth_path = os.path.join(self.depth_dir, f"{base_name}.png")
+                    cv2.imwrite(depth_path, depth_image.astype(np.uint16))
+                    
+                    # 保存可视化深度图像（8位彩色）
+                    valid_depth = depth_image > 0
+                    if valid_depth.any():
+                        depth_min = depth_image[valid_depth].min()
+                        depth_max = depth_image[valid_depth].max()
+                        depth_normalized = np.zeros_like(depth_image, dtype=np.uint8)
+                        if depth_max > depth_min:
+                            depth_normalized[valid_depth] = ((depth_image[valid_depth] - depth_min) / (depth_max - depth_min) * 255).astype(np.uint8)
+                        depth_colormap = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
+                        depth_vis_path = os.path.join(self.depth_dir, f"{base_name}_visualization.png")
+                        cv2.imwrite(depth_vis_path, depth_colormap)
 
-                # # 可视化颜色与深度
-                # valid_depth = depth_image > 0
-                # if valid_depth.any():
-                #     depth_min = depth_image[valid_depth].min()
-                #     depth_max = depth_image[valid_depth].max()
-                #     depth_normalized = np.zeros_like(depth_image, dtype=np.uint8)
-                #     if depth_max > depth_min:
-                #         depth_normalized[valid_depth] = ((depth_image[valid_depth] - depth_min) / (depth_max - depth_min) * 255).astype(np.uint8)
-                #     depth_colormap = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
-                # else:
-                #     depth_colormap = np.zeros((depth_image.shape[0], depth_image.shape[1], 3), dtype=np.uint8)
-
-                # display_size = (640, 480)
-                # color_display = cv2.resize(color_image, display_size)
-                # depth_display = cv2.resize(depth_colormap, display_size)
-                # combined = np.hstack((color_display, depth_display))
-                # cv2.putText(combined, f"Frame: {self.frame_count}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                #v2.imshow('Realtime Color | Depth', combined)
+                # 显示预览窗口
+                self.show_preview(color_image, depth_image, mask_vis)
+                
+                # 确保窗口显示并处理按键
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    print("用户按 'q' 键停止")
+                    break
 
                 # 根据掩码生成3D点云并保存（可选应用手眼标定）
-                if mask_vis is not None and base_name is not None and self.save_pointcloud:
+                points_gripper = None  # 初始化变量
+
+                #import pdb; pdb.set_trace()
+                if mask_vis is not None and base_name is not None:
                     mask_bool = (mask_vis > 0)
                     points, colors = self.generate_pointcloud(color_image, depth_image, mask_bool)
+
+                    #import pdb; pdb.set_trace()
                     if len(points) > 0:
                         # 应用手眼变换：相机→夹爪
-                        points_out = self.apply_hand_eye_transform(points)
+                        points_gripper = self.apply_hand_eye_transform(points)
                         pointcloud_path = os.path.join(self.pointcloud_dir, f"{base_name}_pointcloud.ply")
-                        save_pointcloud_to_file(points_out, colors, pointcloud_path)
+                        save_pointcloud_to_file(points_gripper, colors, pointcloud_path)
                 
                 # don't forget to transform the units, the point cloud is in meter, but robot
                 # control would like to be in mm. 
 
-                print("Step1 : 准备抓取")
-                object_x = points_out[0] * 1000
-                # apply the transformation matrix to the pointcloud\
-                target_pos = [ object_x, object_y, object_z , 0, 0, 0]
-                self.robot.set_digital_output(0, 0, 1) 
-                self.robot.linear_move(target_pos, 1, True, 20)
-                self.robot.set_digital_output(0, 0, 0) 
+                # 计算点云边界框信息（在夹爪坐标系中）
+                if points_gripper is not None:
+                    bbox_info = self.calculate_pointcloud_bbox(points_gripper)
+                    if bbox_info is not None:
+                        print(f"夹爪坐标系点云信息: 中心点={bbox_info['center']}, 尺寸={bbox_info['dimensions']}, 高度={bbox_info['height']:.3f}m")
+                        
+                        if bbox_info['height'] > 0.5:
+                            print("点云高度大于0.5m，something is wrong, 跳过机器人控制")
 
-                # once grasp move the robot back to the liao pan position 
-                print("Step2 : 抓取成功，准备落盘")
-                target_pos = [ 0, 0, 30 , 0, 0, 0]
-                self.robot.linear_move(target_pos, 1, True, 20)
-                self.robot.set_digital_output(0, 0, 0) 
-                print("Step3 : 落盘成功， 回到初始位置")
+                        # 获取当前机器人TCP位置
+                        tcp_ok, current_tcp = self.robot.get_tcp_position()
+                        print(f"当前TCP位置: {current_tcp}")
+                        
+                        #import pdb; pdb.set_trace()
+                        # 夹爪坐标系中的目标中心点（转换为毫米）
+                        center_gripper_mm = bbox_info['center'] * 1000
+                        #import pdb; pdb.set_trace()
+                        # 计算相对移动：从当前TCP位置移动到夹爪坐标系中的目标位置
+                        # 注意：夹爪坐标系中的正z方向可能需要根据实际情况调整
+                        x_offset = center_gripper_mm[0] 
+                        y_offset = center_gripper_mm[1]
+                        z_offset = -(current_tcp[2]-bbox_info['height'] * 1000) + 230
+                        relative_move = [x_offset, y_offset, z_offset, 0, 0, 0]
+                        
+                        print("Step1 : 准备抓取")
+                        print("夹爪坐标系目标中心:", center_gripper_mm)
+                        print("相对移动量:", relative_move)
+                        
+                        # 执行相对移动
+
+                        #import pdb; pdb.set_trace()
+                        self.robot.set_digital_output(0, 0, 1)
+                        self.robot.linear_move(relative_move, 1, True, 20)
+                       
+                        
+                        self.robot.linear_move(original_tcp, 0 , True, 20)
+                        self.robot.set_digital_output(0, 0, 0)
+                        self.robot.logout()
+                        exit()
+
+                else:
+                    print("点云为空，跳过机器人控制")
 
 
 
@@ -537,9 +669,9 @@ def main():
     parser = argparse.ArgumentParser(description='实时人体分割和3D点云生成')
     parser.add_argument('--output_dir', type=str, default='realtime_output',
                       help='输出目录路径 (默认: realtime_output)')
-    parser.add_argument('--device', type=str, default='cpu',
+    parser.add_argument('--device', type=str, default='cuda',
                       choices=['cpu', 'cuda'],
-                      help='运行设备 (默认: cpu)')
+                      help='运行设备 (默认: cuda)')
     parser.add_argument('--save_pointcloud', action='store_true',
                       help='保存3D点云')
     parser.add_argument('--max_frames', type=int, default=None,
