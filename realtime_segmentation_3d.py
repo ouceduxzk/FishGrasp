@@ -117,7 +117,7 @@ class RealtimeSegmentation3D:
                 [ 0.25521958, -0.96025463,  0.11302218],
                 [-0.1972121 ,  0.06273651,  0.97835143]
             ], dtype=np.float32)
-            t_default = np.array([[0.14934404], [0.04630224], [-0.23145773]], dtype=np.float32)
+            t_default = np.array([[0.1434404], [0.04630224], [-0.23145773]], dtype=np.float32)
             self.hand_eye_transform = np.eye(4, dtype=np.float32)
             self.hand_eye_transform[:3, :3] = R_default
             self.hand_eye_transform[:3, 3:4] = t_default
@@ -377,6 +377,40 @@ class RealtimeSegmentation3D:
         transformed = (self.hand_eye_transform @ homo.T).T  # (N,4)
         return transformed[:, :3]
 
+    def _rpy_to_rotation_matrix(self, rx, ry, rz):
+        """
+        将末端的 RPY (rx, ry, rz) 转为旋转矩阵 R (基座→末端)。
+        采用常见的外旋顺序 R = Rz @ Ry @ Rx。
+        """
+        sx, cx = np.sin(rx), np.cos(rx)
+        sy, cy = np.sin(ry), np.cos(ry)
+        sz, cz = np.sin(rz), np.cos(rz)
+
+        Rx = np.array([[1, 0, 0],
+                       [0, cx, -sx],
+                       [0, sx,  cx]], dtype=np.float32)
+        Ry = np.array([[ cy, 0, sy],
+                       [  0, 1,  0],
+                       [-sy, 0, cy]], dtype=np.float32)
+        Rz = np.array([[cz, -sz, 0],
+                       [sz,  cz, 0],
+                       [ 0,   0, 1]], dtype=np.float32)
+
+        return (Rz @ Ry @ Rx).astype(np.float32)
+
+    def _tool_offset_to_base(self, delta_tool_xyz_mm, tcp_rpy):
+        """
+        将夹爪(工具)坐标系下的位移(mm)转换到基坐标系下的位移(mm)。
+        delta_tool_xyz_mm: [dx, dy, dz] in tool frame
+        tcp_rpy: [rx, ry, rz] in radians
+        返回: [dx_base, dy_base, dz_base]
+        """
+        rx, ry, rz = tcp_rpy
+        R_base_tool = self._rpy_to_rotation_matrix(rx, ry, rz)
+        delta_tool = np.asarray(delta_tool_xyz_mm, dtype=np.float32).reshape(3, 1)
+        delta_base = (R_base_tool @ delta_tool).reshape(3)
+        return delta_base.tolist()
+
     def calculate_pointcloud_bbox(self, points):
         """
         计算点云的边界框信息，用于高度和姿态估计
@@ -594,10 +628,13 @@ class RealtimeSegmentation3D:
 
                     #import pdb; pdb.set_trace()
                     if len(points) > 0:
-                        # 应用手眼变换：相机→夹爪
+                        # 保存相机坐标系点云
+                        cam_ply = os.path.join(self.pointcloud_dir, f"{base_name}_cam_pointcloud.ply")
+                        save_pointcloud_to_file(points, colors, cam_ply)
+                        # 应用手眼变换：相机→夹爪，并保存夹爪坐标系点云
                         points_gripper = self.apply_hand_eye_transform(points)
-                        pointcloud_path = os.path.join(self.pointcloud_dir, f"{base_name}_pointcloud.ply")
-                        save_pointcloud_to_file(points_gripper, colors, pointcloud_path)
+                        grip_ply = os.path.join(self.pointcloud_dir, f"{base_name}_gripper_pointcloud.ply")
+                        save_pointcloud_to_file(points_gripper, colors, grip_ply)
                 
                 # don't forget to transform the units, the point cloud is in meter, but robot
                 # control would like to be in mm. 
@@ -621,10 +658,14 @@ class RealtimeSegmentation3D:
                         #import pdb; pdb.set_trace()
                         # 计算相对移动：从当前TCP位置移动到夹爪坐标系中的目标位置
                         # 注意：夹爪坐标系中的正z方向可能需要根据实际情况调整
-                        x_offset = center_gripper_mm[0] 
-                        y_offset = center_gripper_mm[1]
-                        z_offset = -(current_tcp[2]-bbox_info['height'] * 1000) + 200
-                        relative_move = [x_offset -100, y_offset -120, z_offset, 0, 0, 0]
+                        # 将工具系(夹爪)位移转换为基座系位移，以避免x/y方向误差
+                        # 工具系位移：让TCP从当前到达对象中心（忽略姿态变化）
+                        delta_tool_mm = [center_gripper_mm[0], center_gripper_mm[1], bbox_info['height'] * 1000]
+                        # current_tcp: [x(mm), y(mm), z(mm), rx(rad), ry(rad), rz(rad)]
+                        delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
+                        # 调整Z：使用当前z与期望高度差（正值向上/向下依机器人定义，可按实际调试）
+                        z_offset = -(current_tcp[2] - bbox_info['height'] * 1000) + 200
+                        relative_move = [delta_base_xyz[0], delta_base_xyz[1], z_offset, 0, 0, 0]
                         
                         print("Step1 : 准备抓取")
                         print("夹爪坐标系目标中心:", center_gripper_mm)
