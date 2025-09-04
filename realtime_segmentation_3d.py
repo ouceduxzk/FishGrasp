@@ -113,11 +113,11 @@ class RealtimeSegmentation3D:
         # 若未加载到，则使用硬编码的R、t（相机→夹爪）
         if self.hand_eye_transform is None:
             R_default = np.array([
-                [-0.99679381,  0.05832427,  0.05477565],
-                [-0.05664780, -0.99789158,  0.03167684],
-                [ 0.05650769,  0.02847236,  0.99799610]
+                [-0.94655711, -0.27198378, -0.17336224],
+                [ 0.25521958, -0.96025463,  0.11302218],
+                [-0.1972121 ,  0.06273651,  0.97835143]
             ], dtype=np.float32)
-            t_default = np.array([[0.02108376], [0.08418409], [-0.25094157]], dtype=np.float32)
+            t_default = np.array([[0.14934404], [0.04630224], [-0.23145773]], dtype=np.float32)
             self.hand_eye_transform = np.eye(4, dtype=np.float32)
             self.hand_eye_transform[:3, :3] = R_default
             self.hand_eye_transform[:3, 3:4] = t_default
@@ -623,8 +623,8 @@ class RealtimeSegmentation3D:
                         # 注意：夹爪坐标系中的正z方向可能需要根据实际情况调整
                         x_offset = center_gripper_mm[0] 
                         y_offset = center_gripper_mm[1]
-                        z_offset = -(current_tcp[2]-bbox_info['height'] * 1000) + 230
-                        relative_move = [x_offset, y_offset, z_offset, 0, 0, 0]
+                        z_offset = -(current_tcp[2]-bbox_info['height'] * 1000) + 200
+                        relative_move = [x_offset -100, y_offset -120, z_offset, 0, 0, 0]
                         
                         print("Step1 : 准备抓取")
                         print("夹爪坐标系目标中心:", center_gripper_mm)
@@ -633,12 +633,12 @@ class RealtimeSegmentation3D:
                         # 执行相对移动
 
                         #import pdb; pdb.set_trace()
-                        self.robot.set_digital_output(0, 0, 1)
-                        self.robot.linear_move(relative_move, 1, True, 20)
+                        #self.robot.set_digital_output(0, 0, 1)
+                        self.robot.linear_move(relative_move, 1, True, 100)
                        
                         
-                        self.robot.linear_move(original_tcp, 0 , True, 20)
-                        self.robot.set_digital_output(0, 0, 0)
+                        self.robot.linear_move(original_tcp, 0 , True, 100)
+                        #self.robot.set_digital_output(0, 0, 0)
                         self.robot.logout()
                         exit()
 
