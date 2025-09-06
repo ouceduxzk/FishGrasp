@@ -279,7 +279,7 @@ def camera_calibrate(iamges_path, enable_error_analysis=True):
     # 角点的个数以及棋盘格间距
     XX = 9  # 标定板的中长度对应的角点的个数
     YY = 6  # 标定板的中宽度对应的角点的个数
-    L = 0.02475  # 标定板一格的长度  单位为米
+    L = 0.0243  # 标定板一格的长度  单位为米
 
     # 设置寻找亚像素角点的参数，采用的停止准则是最大循环次数30和最大误差容限0.001
     criteria = (cv2.TERM_CRITERIA_MAX_ITER | cv2.TERM_CRITERIA_EPS, 30, 0.001)
@@ -409,6 +409,46 @@ def process_arm_pose(arm_pose_file, gripper_transform=None):
     return R_arm, t_arm
 
 
+def load_calibration_data_for_hand_eye():
+    """
+    为手眼标定误差分析加载标定数据
+    """
+    # 角点的个数以及棋盘格间距
+    XX = 9
+    YY = 6
+    L = 0.02475
+
+    # 设置寻找亚像素角点的参数
+    criteria = (cv2.TERM_CRITERIA_MAX_ITER | cv2.TERM_CRITERIA_EPS, 30, 0.001)
+
+    # 获取标定板角点的位置
+    objp = np.zeros((XX * YY, 3), np.float32)
+    objp[:, :2] = np.mgrid[0:XX, 0:YY].T.reshape(-1, 2)
+    objp = L * objp
+
+    obj_points = []
+    img_points = []
+
+    for i in range(0, 20):
+        image = f"{iamges_path}/{i}.jpg"
+        if os.path.exists(image):
+            img = cv2.imread(image)
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            size = gray.shape[::-1]
+            
+            ret, corners = cv2.findChessboardCorners(gray, (XX, YY), None)
+            
+            if ret:
+                obj_points.append(objp)
+                corners2 = cv2.cornerSubPix(gray, corners, (5, 5), (-1, -1), criteria)
+                if len(corners2) > 0:
+                    img_points.append(corners2)
+                else:
+                    img_points.append(corners)
+
+    return obj_points, img_points
+
+
 def hand_eye_calibrate(gripper_transform=None, enable_error_analysis=True):
     """
     手眼标定主函数
@@ -425,6 +465,63 @@ def hand_eye_calibrate(gripper_transform=None, enable_error_analysis=True):
     
     print("+++++++++++手眼标定完成+++++++++++++++")
     print("注意：手眼标定结果已经考虑了相机畸变校正")
+    
+    # 如果启用了误差分析，进行手眼标定误差分析
+    if enable_error_analysis:
+        print("\n++++++++++开始手眼标定误差分析++++++++++++++")
+        try:
+            # 导入手眼标定误差分析函数
+            from hand_eye_error_analysis import analyze_hand_eye_accuracy, plot_hand_eye_error_analysis
+            
+            # 重新加载标定数据用于误差分析
+            obj_points, img_points = load_calibration_data_for_hand_eye()
+            
+            # 进行手眼标定误差分析
+            analysis_results = analyze_hand_eye_accuracy(
+                R, t, obj_points, img_points, mtx, dist, R_arm, t_arm
+            )
+            
+            # 打印手眼标定误差分析结果
+            print(f"手眼标定总重投影误差: {analysis_results['total_reprojection_error']:.4f} 像素")
+            print(f"误差统计:")
+            stats = analysis_results['error_statistics']
+            print(f"  均值: {stats['mean']:.4f} 像素")
+            print(f"  标准差: {stats['std']:.4f} 像素")
+            print(f"  最大值: {stats['max']:.4f} 像素")
+            print(f"  最小值: {stats['min']:.4f} 像素")
+            print(f"  中位数: {stats['median']:.4f} 像素")
+            
+            print(f"\n手眼标定质量分析:")
+            hand_eye = analysis_results['hand_eye_analysis']
+            print(f"  旋转矩阵正交性误差: {hand_eye['rotation_orthogonality_error']:.6f}")
+            print(f"  旋转矩阵行列式: {hand_eye['rotation_determinant']:.6f}")
+            print(f"  旋转角度: {hand_eye['rotation_angle_degrees']:.2f} 度")
+            print(f"  平移向量模长: {hand_eye['translation_magnitude']:.3f} 米")
+            print(f"  误差变异系数: {hand_eye['error_coefficient_of_variation']:.3f}")
+            
+            # 生成手眼标定误差分析图表
+            plot_hand_eye_error_analysis(analysis_results, iamges_path)
+            
+            # 评估手眼标定质量
+            print("\n++++++++++手眼标定质量评估++++++++++++++")
+            total_error = analysis_results['total_reprojection_error']
+            if total_error < 1.0:
+                print("✅ 手眼标定质量：优秀 (重投影误差 < 1.0 像素)")
+            elif total_error < 2.0:
+                print("✅ 手眼标定质量：良好 (重投影误差 < 2.0 像素)")
+            elif total_error < 5.0:
+                print("⚠️  手眼标定质量：一般 (重投影误差 < 5.0 像素)")
+            else:
+                print("❌ 手眼标定质量：较差 (重投影误差 >= 5.0 像素)")
+                print("建议：重新采集标定数据或检查机械臂位姿精度")
+            
+            print("++++++++++手眼标定误差分析完成++++++++++++++")
+            
+        except ImportError:
+            print("⚠️  无法导入手眼标定误差分析模块，跳过误差分析")
+        except Exception as e:
+            print(f"⚠️  手眼标定误差分析失败: {e}")
+    
     return R, t, mtx, dist
 
 
