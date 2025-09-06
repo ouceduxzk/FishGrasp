@@ -149,11 +149,11 @@ def mask_to_3d_pointcloud(rgb_image, depth_image, mask, fx, fy, cx, cy, mtx=None
     if mtx is not None and dist is not None:
         print("正在校正图像畸变...")
         rgb_image = undistort_image(rgb_image, mtx, dist)
-        depth_image = undistort_image(depth_image, mtx, dist)
-        mask = undistort_image(mask, mtx, dist)
+        #depth_image = undistort_image(depth_image, mtx, dist)
+        #mask = undistort_image(mask, mtx, dist)
         print("图像畸变校正完成")
     
-    height, width = depth_image.shape
+    height, width = rgb_image.shape[:2]
     
     # 创建网格坐标
     y_coords, x_coords = np.meshgrid(np.arange(height), np.arange(width), indexing='ij')

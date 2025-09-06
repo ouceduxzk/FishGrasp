@@ -122,11 +122,11 @@ class RealtimeSegmentation3D:
         # 若未加载到，则使用硬编码的R、t（相机→夹爪）
         if self.hand_eye_transform is None:
             R_default = np.array([
-                [-0.94655711, -0.27198378, -0.17336224],
-                [ 0.25521958, -0.96025463,  0.11302218],
-                [-0.1972121 ,  0.06273651,  0.97835143]
+                [-0.99791369, -0.06094636, -0.02130291],
+                [ 0.06027516, -0.99770511,  0.03084494],
+                [-0.02313391,  0.02949655,  0.99929714]
             ], dtype=np.float32)
-            t_default = np.array([[0.1434404], [0.04630224], [-0.23145773]], dtype=np.float32)
+            t_default = np.array([[0.01], [0.065], [-0.22081495]], dtype=np.float32)
             self.hand_eye_transform = np.eye(4, dtype=np.float32)
             self.hand_eye_transform[:3, :3] = R_default
             self.hand_eye_transform[:3, 3:4] = t_default
@@ -177,9 +177,12 @@ class RealtimeSegmentation3D:
                         depth_image[y, x] = int(dist * 1000)  # 转换为毫米
             
             # 如果启用了畸变校正，校正图像
-            if self.mtx is not None and self.dist is not None:
-                color_image = cv2.undistort(color_image, self.mtx, self.dist)
-                depth_image = cv2.undistort(depth_image, self.mtx, self.dist)
+            # if self.mtx is not None and self.dist is not None:
+            #     color_image = cv2.undistort(color_image, self.mtx, self.dist)
+            #     # # 深度图像需要转换为float32类型进行畸变校正
+            #     # depth_image_float = depth_image.astype(np.float32)
+            #     # depth_image_undistorted = cv2.undistort(depth_image_float, self.mtx, self.dist)
+            #     # depth_image = depth_image_undistorted.astype(np.uint16)
             
             return color_image, depth_image, True
             
@@ -584,7 +587,13 @@ class RealtimeSegmentation3D:
         print("按 'q' 键停止")
         
 
-        tcp_ok, original_tcp = self.robot.get_tcp_position()
+        tcp_result = self.robot.get_tcp_position()
+        if isinstance(tcp_result, tuple) and len(tcp_result) == 2:
+            tcp_ok, original_tcp = tcp_result
+        else:
+            # 如果只返回一个值，假设它是位置信息
+            original_tcp = tcp_result
+            tcp_ok = True
 
         try:
             while True:
@@ -654,49 +663,56 @@ class RealtimeSegmentation3D:
                 # don't forget to transform the units, the point cloud is in meter, but robot
                 # control would like to be in mm. 
 
-                # 计算点云边界框信息（在夹爪坐标系中）
-                if points_gripper is not None:
-                    bbox_info = self.calculate_pointcloud_bbox(points_gripper)
-                    if bbox_info is not None:
-                        print(f"夹爪坐标系点云信息: 中心点={bbox_info['center']}, 尺寸={bbox_info['dimensions']}, 高度={bbox_info['height']:.3f}m")
-                        
-                        if bbox_info['height'] > 0.5:
-                            print("点云高度大于0.5m，something is wrong, 跳过机器人控制")
+                # 计算点云质心（在夹爪坐标系中）
+                if points_gripper is not None and len(points_gripper) > 0:
+                    # 计算点云质心
+                    centroid = np.mean(points_gripper, axis=0)
+                    print(f"夹爪坐标系点云质心: {centroid}")
+                    
+                    # 硬编码高度为0.05m
+                    hardcoded_height = 0.05  # 5cm
+                    print(f"使用硬编码高度: {hardcoded_height:.3f}m")
 
-                        # 获取当前机器人TCP位置
-                        tcp_ok, current_tcp = self.robot.get_tcp_position()
-                        print(f"当前TCP位置: {current_tcp}")
-                        
-                        #import pdb; pdb.set_trace()
-                        # 夹爪坐标系中的目标中心点（转换为毫米）
-                        center_gripper_mm = bbox_info['center'] * 1000
-                        #import pdb; pdb.set_trace()
-                        # 计算相对移动：从当前TCP位置移动到夹爪坐标系中的目标位置
-                        # 注意：夹爪坐标系中的正z方向可能需要根据实际情况调整
-                        # 将工具系(夹爪)位移转换为基座系位移，以避免x/y方向误差
-                        # 工具系位移：让TCP从当前到达对象中心（忽略姿态变化）
-                        delta_tool_mm = [center_gripper_mm[0], center_gripper_mm[1], bbox_info['height'] * 1000]
-                        # current_tcp: [x(mm), y(mm), z(mm), rx(rad), ry(rad), rz(rad)]
-                        delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
-                        # 调整Z：使用当前z与期望高度差（正值向上/向下依机器人定义，可按实际调试）
-                        z_offset = -(current_tcp[2] - bbox_info['height'] * 1000) + 200
-                        relative_move = [delta_base_xyz[0], delta_base_xyz[1], z_offset, 0, 0, 0]
-                        
-                        print("Step1 : 准备抓取")
-                        print("夹爪坐标系目标中心:", center_gripper_mm)
-                        print("相对移动量:", relative_move)
-                        
-                        # 执行相对移动
+                    # 获取当前机器人TCP位置
+                    tcp_result = self.robot.get_tcp_position()
+                    if isinstance(tcp_result, tuple) and len(tcp_result) == 2:
+                        tcp_ok, current_tcp = tcp_result
+                    else:
+                        # 如果只返回一个值，假设它是位置信息
+                        current_tcp = tcp_result
+                        tcp_ok = True
+                    print(f"当前TCP位置: {current_tcp}")
+                    
+                    #import pdb; pdb.set_trace()
+                    # 夹爪坐标系中的目标中心点（转换为毫米）
+                    center_gripper_mm = centroid * 1000
+                    #import pdb; pdb.set_trace()
+                    # 计算相对移动：从当前TCP位置移动到夹爪坐标系中的目标位置
+                    # 注意：夹爪坐标系中的正z方向可能需要根据实际情况调整
+                    # 将工具系(夹爪)位移转换为基座系位移，以避免x/y方向误差
+                    # 工具系位移：让TCP从当前到达对象中心（忽略姿态变化）
+                    delta_tool_mm = [center_gripper_mm[0] , center_gripper_mm[1], hardcoded_height* 1000]
+                    # current_tcp: [x(mm), y(mm), z(mm), rx(rad), ry(rad), rz(rad)]
+                    delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
+                    # 调整Z：使用当前z与期望高度差（正值向上/向下依机器人定义，可按实际调试）
+                    z_offset = -(current_tcp[2] - hardcoded_height * 1000) + 220
+                    relative_move = [delta_base_xyz[0] +0,delta_base_xyz[1] +0, z_offset, 0, 0, 0]
+                    
+                    print("Step1 : 准备抓取")
+                    print("夹爪坐标系目标中心:", center_gripper_mm)
+                    print("相对移动量:", relative_move)
+                    
+                    # 执行相对移动
 
-                        #import pdb; pdb.set_trace()
-                        #self.robot.set_digital_output(0, 0, 1)
-                        self.robot.linear_move(relative_move, 1, True, 100)
-                       
-                        
-                        self.robot.linear_move(original_tcp, 0 , True, 100)
-                        #self.robot.set_digital_output(0, 0, 0)
-                        self.robot.logout()
-                        exit()
+                    #import pdb; pdb.set_trace()
+                    #self.robot.set_digital_output(0, 0, 1)
+                    self.robot.linear_move(relative_move, 1, True, 400)
+                    
+                    
+                    self.robot.linear_move(original_tcp, 0 , True, 400)
+                    #self.robot.set_digital_output(0, 0, 0)
+                    #self.robot.logout()
+                    #exit()
 
                 else:
                     print("点云为空，跳过机器人控制")
