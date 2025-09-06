@@ -85,9 +85,18 @@ class RealtimeSegmentation3D:
         if self.pipeline is None:
             raise RuntimeError("无法启动RealSense相机")
         
-        # 获取相机内参
-        self.fx, self.fy, self.cx, self.cy = load_camera_intrinsics(intrinsics_file)
+        # 获取相机内参和畸变系数
+        self.fx, self.fy, self.cx, self.cy, self.dist, self.mtx = load_camera_intrinsics(intrinsics_file)
         print(f"使用相机内参: fx={self.fx}, fy={self.fy}, cx={self.cx}, cy={self.cy}")
+        
+        # 检查是否使用畸变校正
+        if np.any(self.dist != 0):
+            print("检测到畸变系数，将进行实时图像畸变校正")
+            print(f"畸变系数: k1={self.dist[0]:.6f}, k2={self.dist[1]:.6f}, k3={self.dist[4]:.6f}")
+        else:
+            print("未检测到畸变系数，跳过畸变校正")
+            self.mtx = None
+            self.dist = None
         
         # 创建对齐对象
         import pyrealsense2 as rs
@@ -166,6 +175,11 @@ class RealtimeSegmentation3D:
                     dist = depth_frame.get_distance(x, y)
                     if dist > 0:
                         depth_image[y, x] = int(dist * 1000)  # 转换为毫米
+            
+            # 如果启用了畸变校正，校正图像
+            if self.mtx is not None and self.dist is not None:
+                color_image = cv2.undistort(color_image, self.mtx, self.dist)
+                depth_image = cv2.undistort(depth_image, self.mtx, self.dist)
             
             return color_image, depth_image, True
             
@@ -344,12 +358,13 @@ class RealtimeSegmentation3D:
             # 转换为RGB格式
             color_image_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
             
-            # 使用mask_to_3d_pointcloud函数
+            # 使用mask_to_3d_pointcloud函数（支持畸变校正）
             points, colors = mask_to_3d_pointcloud(
                 color_image_rgb, 
                 depth_image_meters, 
                 mask, 
-                self.fx, self.fy, self.cx, self.cy
+                self.fx, self.fy, self.cx, self.cy,
+                self.mtx, self.dist
             )
             
             return points, colors
