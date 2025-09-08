@@ -44,7 +44,7 @@ for _p in _extra_paths:
         pass
 
 class RealtimeSegmentation3D:
-    def __init__(self, output_dir, device="cpu", save_pointcloud=True, intrinsics_file=None, hand_eye_file=None):
+    def __init__(self, output_dir, device="cpu", save_pointcloud=True, intrinsics_file=None, hand_eye_file=None, bbox_selection="smallest", debug=False):
         """
         初始化实时分割和3D点云生成器
         
@@ -54,26 +54,34 @@ class RealtimeSegmentation3D:
             save_pointcloud: 是否保存3D点云
             intrinsics_file: 相机内参JSON文件路径
             hand_eye_file: 手眼标定4x4齐次矩阵的.npy文件路径（相机→夹爪）
+            bbox_selection: 边界框选择策略 ("smallest" 或 "largest")
+            debug: 是否启用调试模式（保存所有中间文件）
         """
         self.output_dir = output_dir
         self.device = device
         self.save_pointcloud = save_pointcloud
+        self.bbox_selection = bbox_selection
+        self.debug = debug
         
-        # 创建输出目录
-        self.rgb_dir = os.path.join(output_dir, "rgb")
-        self.depth_dir = os.path.join(output_dir, "depth")
-        self.mask_dir = os.path.join(output_dir, "masks")
-        self.pointcloud_dir = os.path.join(output_dir, "pointclouds")
-        self.segmentation_dir = os.path.join(output_dir, "segmentation")
-        self.detection_dir = os.path.join(output_dir, "detection")
-        
-        os.makedirs(self.rgb_dir, exist_ok=True)
-        os.makedirs(self.depth_dir, exist_ok=True)
-        os.makedirs(self.mask_dir, exist_ok=True)
-        if save_pointcloud:
-            os.makedirs(self.pointcloud_dir, exist_ok=True)
-        os.makedirs(self.segmentation_dir, exist_ok=True)
-        os.makedirs(self.detection_dir, exist_ok=True)
+        # 创建输出目录（仅在debug模式下创建）
+        if self.debug:
+            self.rgb_dir = os.path.join(output_dir, "rgb")
+            self.depth_dir = os.path.join(output_dir, "depth")
+            self.mask_dir = os.path.join(output_dir, "masks")
+            self.pointcloud_dir = os.path.join(output_dir, "pointclouds")
+            self.segmentation_dir = os.path.join(output_dir, "segmentation")
+            self.detection_dir = os.path.join(output_dir, "detection")
+            
+            os.makedirs(self.rgb_dir, exist_ok=True)
+            os.makedirs(self.depth_dir, exist_ok=True)
+            os.makedirs(self.mask_dir, exist_ok=True)
+            if save_pointcloud:
+                os.makedirs(self.pointcloud_dir, exist_ok=True)
+            os.makedirs(self.segmentation_dir, exist_ok=True)
+            os.makedirs(self.detection_dir, exist_ok=True)
+            print("调试模式已启用，将保存所有中间文件")
+        else:
+            print("正常模式，不保存中间文件")
         
         # 初始化模型
         print("正在初始化AI模型...")
@@ -106,6 +114,16 @@ class RealtimeSegmentation3D:
         self.frame_count = 0
         self.start_time = time.time()
         
+        # 计时器
+        self.timers = {
+            'detection': [],
+            'segmentation': [],
+            'pointcloud_generation': [],
+            'grasp_calculation': [],
+            'robot_movement': [],
+            'total_cycle': []
+        }
+        
         # 加载手眼标定矩阵（可选）
         self.hand_eye_transform = None  # 4x4 齐次矩阵，相机坐标→夹爪坐标
         if hand_eye_file is not None and os.path.exists(hand_eye_file):
@@ -126,7 +144,7 @@ class RealtimeSegmentation3D:
                 [ 0.06027516, -0.99770511,  0.03084494],
                 [-0.02313391,  0.02949655,  0.99929714]
             ], dtype=np.float32)
-            t_default = np.array([[0.01], [0.065], [-0.22081495]], dtype=np.float32)
+            t_default = np.array([[0.04], [0.065], [-0.22081495]], dtype=np.float32)
             self.hand_eye_transform = np.eye(4, dtype=np.float32)
             self.hand_eye_transform[:3, :3] = R_default
             self.hand_eye_transform[:3, 3:4] = t_default
@@ -139,6 +157,38 @@ class RealtimeSegmentation3D:
         import jkrc 
         self.robot = jkrc.RC("192.168.80.116")
         self.robot.login()   
+    
+    def time_step(self, step_name):
+        """计时器装饰器，用于测量各个步骤的时间"""
+        def decorator(func):
+            def wrapper(*args, **kwargs):
+                start_time = time.time()
+                result = func(*args, **kwargs)
+                end_time = time.time()
+                elapsed = end_time - start_time
+                self.timers[step_name].append(elapsed)
+                print(f"⏱️  {step_name}: {elapsed:.3f}s")
+                return result
+            return wrapper
+        return decorator
+    
+    def print_timing_summary(self):
+        """打印时间统计摘要"""
+        print("\n" + "="*60)
+        print("📊 时间统计摘要")
+        print("="*60)
+        
+        for step_name, times in self.timers.items():
+            if times:
+                avg_time = np.mean(times)
+                min_time = np.min(times)
+                max_time = np.max(times)
+                total_time = np.sum(times)
+                print(f"{step_name:20s}: 平均={avg_time:.3f}s, 最小={min_time:.3f}s, 最大={max_time:.3f}s, 总计={total_time:.3f}s")
+            else:
+                print(f"{step_name:20s}: 无数据")
+        
+        print("="*60)
     
     def capture_frames(self):
         """
@@ -193,86 +243,121 @@ class RealtimeSegmentation3D:
     def detect_and_segment_and_dump(self, color_image):
         """
         本地完成检测->落盘->分割->落盘，返回用于显示的单通道uint8掩码（0/255）。
-        无检测时返回None。
+        只选择一条鱼进行分割，无检测时返回None。
         """
-        # 检测
+        # 检测（只选择一条鱼）
+        detection_start = time.time()
         boxes = self._detect_boxes(color_image)
+        detection_time = time.time() - detection_start
+        self.timers['detection'].append(detection_time)
+        print(f"⏱️  detection: {detection_time:.3f}s")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         base_name = f"frame_{self.frame_count:06d}_{timestamp}"
-        det_vis = color_image.copy()
-        for idx, (x1, y1, x2, y2) in enumerate(boxes):
-            cv2.rectangle(det_vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            crop = color_image[y1:y2, x1:x2]
-            if crop.size > 0:
-                cv2.imwrite(os.path.join(self.detection_dir, f"{base_name}_det_{idx}.png"), crop)
-        if len(boxes) > 0:
-            cv2.imwrite(os.path.join(self.detection_dir, f"{base_name}_dino_detection.png"), det_vis)
+        
+        # 保存检测可视化（仅在debug模式下）
+        if self.debug:
+            det_vis = color_image.copy()
+            if len(boxes) > 0:
+                # 只标记选中的鱼（绿色框）
+                x1, y1, x2, y2 = boxes[0]
+                cv2.rectangle(det_vis, (x1, y1), (x2, y2), (0, 255, 0), 3)  # 绿色粗框表示选中的鱼
+                cv2.putText(det_vis, "SELECTED", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                # 保存选中的鱼的裁剪图像
+                crop = color_image[y1:y2, x1:x2]
+                if crop.size > 0:
+                    cv2.imwrite(os.path.join(self.detection_dir, f"{base_name}_selected_fish.png"), crop)
+                
+                cv2.imwrite(os.path.join(self.detection_dir, f"{base_name}_dino_detection.png"), det_vis)
 
         if not boxes:
             print("未检测到目标，跳过分割。")
             return None, None
 
-        # 分割（SAM）
+        # 分割（SAM）- 只处理选中的一条鱼
+        segmentation_start = time.time()
         try:
             image_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
             self.sam_predictor.set_image(image_rgb)
-            boxes_tensor = torch.tensor([[x1, y1, x2, y2] for (x1, y1, x2, y2) in boxes], device=self.device)
+            
+            # 只使用选中的边界框
+            x1, y1, x2, y2 = boxes[0]
+            boxes_tensor = torch.tensor([[x1, y1, x2, y2]], device=self.device)
             transformed_boxes = self.sam_predictor.transform.apply_boxes_torch(boxes_tensor, image_rgb.shape[:2])
 
+            # 使用multimask_output=False确保只返回一个掩码
             masks, scores, logits = self.sam_predictor.predict_torch(
                 point_coords=None,
                 point_labels=None,
                 boxes=transformed_boxes,
-                multimask_output=False
+                multimask_output=False  # 只返回一个最佳掩码
             )
 
-            # 为每个目标分别保存掩码（全图与裁剪）以及裁剪可视化
-            per_object_masks = []
-            for idx in range(masks.shape[0]):
-                m_bool = masks[idx][0].cpu().numpy().astype(np.uint8)
-                m_u8 = m_bool * 255
-                x1, y1, x2, y2 = boxes[idx]
-                # 全图掩码
-                mask_full_path = os.path.join(self.segmentation_dir, f"{base_name}_obj{idx}_mask.png")
-                cv2.imwrite(mask_full_path, m_u8)
-                # 裁剪掩码
-                mask_crop = m_u8[y1:y2, x1:x2]
-                if mask_crop.size > 0:
-                    mask_crop_path = os.path.join(self.segmentation_dir, f"{base_name}_obj{idx}_mask_crop.png")
-                    cv2.imwrite(mask_crop_path, mask_crop)
-                # 裁剪可视化
-                crop = color_image[y1:y2, x1:x2]
-                if crop.size > 0 and mask_crop.size > 0:
-                    overlay = np.zeros_like(crop)
-                    overlay[mask_crop > 0] = [0, 255, 0]
-                    vis_crop = cv2.addWeighted(crop, 1.0, overlay, 0.4, 0)
-                    vis_crop_path = os.path.join(self.segmentation_dir, f"{base_name}_obj{idx}_mask_crop_vis.png")
-                    cv2.imwrite(vis_crop_path, vis_crop)
-                per_object_masks.append(m_u8)
-
-            # 合并掩码并保存整体可视化
-            combined = np.zeros_like(per_object_masks[0], dtype=np.uint8)
-            for m_u8 in per_object_masks:
-                combined = np.maximum(combined, m_u8)
-            mask_np = combined
-
-            mask_path = os.path.join(self.segmentation_dir, f"{base_name}_mask.png")
-            cv2.imwrite(mask_path, mask_np)
-
-            colored = np.zeros_like(color_image)
-            colored[mask_np > 0] = [0, 255, 0]
-            vis = cv2.addWeighted(color_image, 1.0, colored, 0.4, 0)
-            vis_path = os.path.join(self.segmentation_dir, f"{base_name}_mask_vis.png")
-            cv2.imwrite(vis_path, vis)
-
-            return mask_np, base_name
+            # 处理选中的鱼的掩码 - 确保只使用第一个掩码
+            if masks.shape[0] > 0 and masks.shape[1] > 0:
+                # 只取第一个掩码（索引[0][0]）
+                m_bool = masks[0][0].cpu().numpy().astype(np.uint8)
+                mask_np = m_bool * 255
+                
+                # 进一步限制掩码只在边界框区域内
+                # 创建一个全零掩码
+                restricted_mask = np.zeros_like(mask_np)
+                # 只在边界框区域内应用掩码
+                restricted_mask[y1:y2, x1:x2] = mask_np[y1:y2, x1:x2]
+                mask_np = restricted_mask
+                
+                # 保存掩码（仅在debug模式下）
+                if self.debug:
+                    mask_path = os.path.join(self.segmentation_dir, f"{base_name}_selected_fish_mask.png")
+                    cv2.imwrite(mask_path, mask_np)
+                    
+                    # 保存裁剪掩码
+                    mask_crop = mask_np[y1:y2, x1:x2]
+                    if mask_crop.size > 0:
+                        mask_crop_path = os.path.join(self.segmentation_dir, f"{base_name}_selected_fish_mask_crop.png")
+                        cv2.imwrite(mask_crop_path, mask_crop)
+                    
+                    # 保存裁剪可视化
+                    crop = color_image[y1:y2, x1:x2]
+                    if crop.size > 0 and mask_crop.size > 0:
+                        overlay = np.zeros_like(crop)
+                        overlay[mask_crop > 0] = [0, 255, 0]
+                        vis_crop = cv2.addWeighted(crop, 1.0, overlay, 0.4, 0)
+                        vis_crop_path = os.path.join(self.segmentation_dir, f"{base_name}_selected_fish_vis.png")
+                        cv2.imwrite(vis_crop_path, vis_crop)
+                    
+                    # 保存整体可视化
+                    colored = np.zeros_like(color_image)
+                    colored[mask_np > 0] = [0, 255, 0]
+                    vis = cv2.addWeighted(color_image, 1.0, colored, 0.4, 0)
+                    vis_path = os.path.join(self.segmentation_dir, f"{base_name}_selected_fish_overlay.png")
+                    cv2.imwrite(vis_path, vis)
+                
+                segmentation_time = time.time() - segmentation_start
+                self.timers['segmentation'].append(segmentation_time)
+                print(f"⏱️  segmentation: {segmentation_time:.3f}s")
+                
+                print(f"成功分割选中的鱼，掩码点数: {np.sum(mask_np > 0)}")
+                print(f"掩码限制在边界框内: ({x1}, {y1}) 到 ({x2}, {y2})")
+                return mask_np, base_name
+            else:
+                segmentation_time = time.time() - segmentation_start
+                self.timers['segmentation'].append(segmentation_time)
+                print(f"⏱️  segmentation: {segmentation_time:.3f}s")
+                print("分割失败，未生成掩码")
+                return None, None
+                
         except Exception as e:
+            segmentation_time = time.time() - segmentation_start
+            self.timers['segmentation'].append(segmentation_time)
+            print(f"⏱️  segmentation: {segmentation_time:.3f}s")
             print(f"分割时出错: {e}")
             return None, None
 
     def _detect_boxes(self, color_image):
         """
         使用与 seg.py 相同的方式进行检测，返回bbox列表
+        只选择一条鱼进行分割和抓取
         """
         # 转换为PIL图像（与 seg.py 一致）
         image_pil = Image.fromarray(cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB))
@@ -295,7 +380,7 @@ class RealtimeSegmentation3D:
         if len(result["boxes"]) == 0:
             return boxes
         
-        # 过滤边界框：面积必须大于1000像素，并选择最大的一个
+        # 过滤边界框：面积必须大于1000像素
         valid_boxes = []
         for box in result["boxes"]:
             x1, y1, x2, y2 = [int(c) for c in box.tolist()]
@@ -310,10 +395,22 @@ class RealtimeSegmentation3D:
                 valid_boxes.append(((x1, y1, x2, y2), area))
         
         if valid_boxes:
-            # 选择面积最小的边界框
-            smallest_box = min(valid_boxes, key=lambda x: x[1])
-            boxes.append(smallest_box[0])
-            print(f"选择最小边界框，面积: {smallest_box[1]} 像素")
+            # 根据选择策略选择边界框
+            if self.bbox_selection == "smallest":
+                selected_box = min(valid_boxes, key=lambda x: x[1])
+                selection_type = "面积最小的"
+            elif self.bbox_selection == "largest":
+                selected_box = max(valid_boxes, key=lambda x: x[1])
+                selection_type = "面积最大的"
+            else:
+                # 默认选择最小的
+                selected_box = min(valid_boxes, key=lambda x: x[1])
+                selection_type = "面积最小的"
+                print(f"警告: 未知的选择策略 '{self.bbox_selection}'，使用默认策略 'smallest'")
+            
+            boxes.append(selected_box[0])
+            print(f"检测到 {len(valid_boxes)} 条鱼，选择{selection_type}进行抓取，面积: {selected_box[1]} 像素")
+            print(f"选择的鱼位置: {selected_box[0]}")
         else:
             print("没有满足面积要求的边界框")
         
@@ -597,6 +694,9 @@ class RealtimeSegmentation3D:
 
         try:
             while True:
+                # 整个循环计时开始
+                cycle_start = time.time()
+                
                 # 捕获帧
                 color_image, depth_image, success = self.capture_frames()
                 if not success:
@@ -611,8 +711,8 @@ class RealtimeSegmentation3D:
                 # 检测 + 分割 + 落盘
                 mask_vis, base_name = self.detect_and_segment_and_dump(color_image)
                 
-                # 保存RGB和深度图像
-                if base_name is not None:
+                # 保存RGB和深度图像（仅在debug模式下）
+                if self.debug and base_name is not None:
                     # 保存RGB图像
                     rgb_path = os.path.join(self.rgb_dir, f"{base_name}.png")
                     cv2.imwrite(rgb_path, color_image)
@@ -647,24 +747,36 @@ class RealtimeSegmentation3D:
 
                 #import pdb; pdb.set_trace()
                 if mask_vis is not None and base_name is not None:
+                    # 点云生成计时
+                    pointcloud_start = time.time()
                     mask_bool = (mask_vis > 0)
                     points, colors = self.generate_pointcloud(color_image, depth_image, mask_bool)
+                    pointcloud_time = time.time() - pointcloud_start
+                    self.timers['pointcloud_generation'].append(pointcloud_time)
+                    print(f"⏱️  pointcloud_generation: {pointcloud_time:.3f}s")
 
                     #import pdb; pdb.set_trace()
                     if len(points) > 0:
-                        # 保存相机坐标系点云
-                        cam_ply = os.path.join(self.pointcloud_dir, f"{base_name}_cam_pointcloud.ply")
-                        save_pointcloud_to_file(points, colors, cam_ply)
-                        # 应用手眼变换：相机→夹爪，并保存夹爪坐标系点云
+                        # 应用手眼变换：相机→夹爪
                         points_gripper = self.apply_hand_eye_transform(points)
-                        grip_ply = os.path.join(self.pointcloud_dir, f"{base_name}_gripper_pointcloud.ply")
-                        save_pointcloud_to_file(points_gripper, colors, grip_ply)
+                        
+                        # 保存点云（仅在debug模式下）
+                        if self.debug:
+                            # 保存相机坐标系点云
+                            cam_ply = os.path.join(self.pointcloud_dir, f"{base_name}_cam_pointcloud.ply")
+                            save_pointcloud_to_file(points, colors, cam_ply)
+                            # 保存夹爪坐标系点云
+                            grip_ply = os.path.join(self.pointcloud_dir, f"{base_name}_gripper_pointcloud.ply")
+                            save_pointcloud_to_file(points_gripper, colors, grip_ply)
                 
                 # don't forget to transform the units, the point cloud is in meter, but robot
                 # control would like to be in mm. 
 
                 # 计算点云质心（在夹爪坐标系中）
                 if points_gripper is not None and len(points_gripper) > 0:
+                    # 抓取点计算计时
+                    grasp_calc_start = time.time()
+                    
                     # 计算点云质心
                     centroid = np.mean(points_gripper, axis=0)
                     print(f"夹爪坐标系点云质心: {centroid}")
@@ -698,12 +810,18 @@ class RealtimeSegmentation3D:
                     z_offset = -(current_tcp[2] - hardcoded_height * 1000) + 220
                     relative_move = [delta_base_xyz[0] +0,delta_base_xyz[1] +0, z_offset, 0, 0, 0]
                     
+                    grasp_calc_time = time.time() - grasp_calc_start
+                    self.timers['grasp_calculation'].append(grasp_calc_time)
+                    print(f"⏱️  grasp_calculation: {grasp_calc_time:.3f}s")
+                    
                     print("Step1 : 准备抓取")
                     print("夹爪坐标系目标中心:", center_gripper_mm)
                     print("相对移动量:", relative_move)
                     
+                    # 机器人移动计时
+                    robot_movement_start = time.time()
+                    
                     # 执行相对移动
-
                     #import pdb; pdb.set_trace()
                     #self.robot.set_digital_output(0, 0, 1)
                     self.robot.linear_move(relative_move, 1, True, 400)
@@ -713,12 +831,19 @@ class RealtimeSegmentation3D:
                     #self.robot.set_digital_output(0, 0, 0)
                     #self.robot.logout()
                     #exit()
+                    
+                    robot_movement_time = time.time() - robot_movement_start
+                    self.timers['robot_movement'].append(robot_movement_time)
+                    print(f"⏱️  robot_movement: {robot_movement_time:.3f}s")
 
                 else:
                     print("点云为空，跳过机器人控制")
 
-
-
+                # 整个循环计时结束
+                cycle_time = time.time() - cycle_start
+                self.timers['total_cycle'].append(cycle_time)
+                print(f"⏱️  total_cycle: {cycle_time:.3f}s")
+                print("-" * 50)
 
         except KeyboardInterrupt:
             print("\n用户中断处理")
@@ -734,6 +859,10 @@ class RealtimeSegmentation3D:
         cv2.destroyAllWindows()
         if self.pipeline:
             self.pipeline.stop()
+        
+        # 打印时间统计摘要
+        self.print_timing_summary()
+        
         print(f"处理完成！总共处理了 {self.frame_count} 帧")
         print(f"结果保存在: {self.output_dir}")
 
@@ -754,6 +883,11 @@ def main():
                       help='相机内参JSON文件路径')
     parser.add_argument('--hand_eye_file', type=str, default=None,
                       help='手眼标定4x4齐次矩阵的.npy文件路径（相机→夹爪）')
+    parser.add_argument('--bbox_selection', type=str, default='largest',
+                      choices=['smallest', 'largest'],
+                      help='边界框选择策略: smallest(选择面积最小的鱼) 或 largest(选择面积最大的鱼) (默认: largest)')
+    parser.add_argument('--debug', action='store_true',
+                      help='启用调试模式，保存所有中间文件（RGB、深度、检测、分割、点云）')
     
     args = parser.parse_args()
     
@@ -764,7 +898,9 @@ def main():
             device=args.device,
             save_pointcloud=args.save_pointcloud,
             intrinsics_file=args.intrinsics_file,
-            hand_eye_file=args.hand_eye_file
+            hand_eye_file=args.hand_eye_file,
+            bbox_selection=args.bbox_selection,
+            debug=args.debug
         )
         
         # 运行实时处理
