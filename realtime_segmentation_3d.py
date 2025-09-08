@@ -968,7 +968,7 @@ class RealtimeSegmentation3D:
                     # current_tcp: [x(mm), y(mm), z(mm), rx(rad), ry(rad), rz(rad)]
                     delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
                     # 调整Z：使用当前z与期望高度差（正值向上/向下依机器人定义，可按实际调试）
-                    z_offset = -(current_tcp[2] - hardcoded_height * 1000) + 220
+                    z_offset = -(current_tcp[2] - hardcoded_height * 1000) + 200
                     relative_move = [delta_base_xyz[0] +0,delta_base_xyz[1] +0, z_offset, 0, 0, 0]
                     
                     grasp_calc_time = time.time() - grasp_calc_start
@@ -984,12 +984,20 @@ class RealtimeSegmentation3D:
                     
                     # 执行相对移动
                     #import pdb; pdb.set_trace()
-                    #self.robot.set_digital_output(0, 0, 1)
+                    self.robot.set_digital_output(0, 0, 1)
                     self.robot.linear_move(relative_move, 1, True, 400)
-                    
-                    
+
+                    #  robot move up of 20 cm relatively 
+                    self.robot.linear_move([0, 0, 250, 0, 0, 0], 1 , True, 400)
+                    # time.sleep(0.02)
+                    # # robot move 35 cm in the y+ direction relatively 
+                    self.robot.linear_move([100, 350, 0, 0, 0, 0], 1 , True, 400)
+                    #self.robot.linear_move(original_tcp, 0 , True, 400)
+                    self.robot.set_digital_output(0, 0, 0)
+                    #time.sleep(0.01)
+                    #robot move back to the original position
                     self.robot.linear_move(original_tcp, 0 , True, 400)
-                    #self.robot.set_digital_output(0, 0, 0)
+                    
                     #self.robot.logout()
                     #exit()
                     
