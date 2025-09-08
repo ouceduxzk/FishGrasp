@@ -8,14 +8,14 @@ Ultralytics YOLO 训练脚本
 - 可选导出ONNX与TorchScript
 
 示例：
-  python train_yolo.py \
-    --data /path/to/dataset.yaml \
+  python3 detection/train_yolo.py \
+    --data ./datasets/new_data_98_dataset/dataset.yaml \
     --model yolov8s.pt \
     --epochs 100 \
     --batch 16 \
     --imgsz 640 \
     --project runs/train \
-    --name fish_yolov8s_$(date +%Y%m%d_%H%M%S)
+    --name single_yolov8s_$(date +%Y%m%d_%H%M%S)
 
 数据集YAML示例(data.yaml)：
   path: /abs/path/to/dataset
@@ -55,7 +55,74 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--exist-ok", action="store_true", help="允许覆盖已存在的目录")
     parser.add_argument("--resume", action="store_true", help="从最近的断点恢复训练")
     parser.add_argument("--export", action="store_true", help="训练完成后导出ONNX与TorchScript")
+    # 新增：数据增强与bbox损失控制
+    parser.add_argument("--aug", type=str, choices=["none", "light", "strong"], default="strong", help="数据增强强度")
+    parser.add_argument("--box_gain", type=float, default=1.75, help="bbox损失增益(越大越严格)")
+    parser.add_argument("--close_mosaic", type=int, default=10, help="训练末尾关闭mosaic的轮数")
     return parser.parse_args()
+
+
+def build_aug_overrides(aug_level: str, box_gain: float, close_mosaic: int):
+    """根据增强强度构造Ultralytics的overrides参数。"""
+    # 合理的默认(强增强)：目标是显著增加样本多样性（相当于10x有效多样化）
+    if aug_level == "strong":
+        overrides = dict(
+            mosaic=1.0,
+            mixup=0.2,
+            copy_paste=0.3,
+            degrees=10.0,
+            translate=0.20,
+            scale=0.50,   # 缩放范围 ±50%
+            shear=2.0,
+            perspective=0.000,
+            flipud=0.10,
+            fliplr=0.50,
+            hsv_h=0.015,
+            hsv_s=0.7,
+            hsv_v=0.4,
+            erasing=0.4,
+            box=box_gain,
+            close_mosaic=close_mosaic,
+        )
+    elif aug_level == "light":
+        overrides = dict(
+            mosaic=0.8,
+            mixup=0.1,
+            copy_paste=0.1,
+            degrees=5.0,
+            translate=0.10,
+            scale=0.30,
+            shear=1.0,
+            perspective=0.000,
+            flipud=0.05,
+            fliplr=0.5,
+            hsv_h=0.010,
+            hsv_s=0.5,
+            hsv_v=0.3,
+            erasing=0.2,
+            box=box_gain,
+            close_mosaic=close_mosaic,
+        )
+    else:  # none
+        overrides = dict(
+            mosaic=0.0,
+            mixup=0.0,
+            copy_paste=0.0,
+            degrees=0.0,
+            translate=0.0,
+            scale=0.0,
+            shear=0.0,
+            perspective=0.0,
+            flipud=0.0,
+            fliplr=0.0,
+            hsv_h=0.0,
+            hsv_s=0.0,
+            hsv_v=0.0,
+            erasing=0.0,
+            box=box_gain,
+            close_mosaic=close_mosaic,
+        )
+    return overrides
 
 
 def main():
@@ -97,10 +164,16 @@ def main():
     print(f"seed      : {args.seed}")
     print(f"exist_ok  : {args.exist_ok}")
     print(f"resume    : {args.resume}")
+    print(f"aug       : {args.aug}")
+    print(f"box_gain  : {args.box_gain}")
+    print(f"close_mosaic: {args.close_mosaic}")
     print("==========================")
 
     # 创建与加载模型
     model = YOLO(args.model)
+
+    # 构造增强与损失覆盖参数
+    overrides = build_aug_overrides(args.aug, args.box_gain, args.close_mosaic)
 
     # 训练
     results = model.train(
@@ -120,6 +193,7 @@ def main():
         exist_ok=args.exist_ok,
         resume=args.resume,
         verbose=True,
+        **overrides,
     )
 
     # 结果目录与best.pt

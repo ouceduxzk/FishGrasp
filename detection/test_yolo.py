@@ -8,16 +8,16 @@ Ultralytics YOLO 测试脚本
 
 示例：
   # 在验证集上评测
-  python train/test_yolo.py \
-    --weights runs/train/your_exp/weights/best.pt \
+  python3 detection/test_yolo.py \
+    --weights runs/train/single_yolov8s_20250908_152257/weights/best.pt \
     --data ../datasets/yolo_dataset/dataset.yaml \
     --imgsz 640 \
-    --mode validate
+    --mode predict
 
   # 对文件夹做推理并保存结果
-  python train/test_yolo.py \
-    --weights runs/train/your_exp/weights/best.pt \
-    --source ./datasets/yolo_dataset/images/val \
+  python3 detection/test_yolo.py \
+    --weights runs/train/single_yolov8s_20250908_152257/weights/best.pt \
+    --source ./datasets/new_data_98_dataset/images/test \
     --imgsz 640 \
     --conf 0.25 \
     --mode predict \
@@ -28,6 +28,7 @@ Ultralytics YOLO 测试脚本
 import os
 import sys
 import argparse
+from pathlib import Path
 
 
 def parse_args():
@@ -44,7 +45,16 @@ def parse_args():
     ap.add_argument("--name", default="", help="任务名(默认自动)")
     ap.add_argument("--save_txt", action="store_true", help="保存 YOLO txt 结果(预测)")
     ap.add_argument("--save_conf", action="store_true", help="在 txt 中保存置信度")
+    ap.add_argument("--recursive", action="store_true", help="当 --source 为目录时递归查找(默认仅当前目录)")
     return ap.parse_args()
+
+
+def list_images_in_dir(dir_path: Path, recursive: bool = False):
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+    if recursive:
+        return [p for p in dir_path.rglob("*") if p.suffix.lower() in exts]
+    else:
+        return [p for p in dir_path.iterdir() if p.is_file() and p.suffix.lower() in exts]
 
 
 def main():
@@ -77,8 +87,21 @@ def main():
         if not args.source:
             print("[错误] predict 模式需要 --source 输入")
             sys.exit(1)
+
+        src = Path(args.source)
+        sources = None
+        if src.is_dir():
+            # 严格限制在该目录（默认非递归）
+            sources = list_images_in_dir(src, recursive=args.recursive)
+            if not sources:
+                print(f"[错误] 目录下未找到图像: {src}")
+                sys.exit(1)
+        else:
+            # 单个文件或其他流式输入，直接传递
+            sources = [str(src)]
+
         results = model.predict(
-            source=args.source,
+            source=[str(p) for p in sources],
             imgsz=args.imgsz,
             conf=args.conf,
             iou=args.iou,

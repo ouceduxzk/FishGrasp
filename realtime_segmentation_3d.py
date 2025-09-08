@@ -44,7 +44,7 @@ for _p in _extra_paths:
         pass
 
 class RealtimeSegmentation3D:
-    def __init__(self, output_dir, device="cpu", save_pointcloud=True, intrinsics_file=None, hand_eye_file=None, bbox_selection="smallest", debug=False):
+    def __init__(self, output_dir, device="cpu", save_pointcloud=True, intrinsics_file=None, hand_eye_file=None, bbox_selection="smallest", debug=False, use_yolo=False, yolo_weights=None):
         """
         初始化实时分割和3D点云生成器
         
@@ -56,13 +56,16 @@ class RealtimeSegmentation3D:
             hand_eye_file: 手眼标定4x4齐次矩阵的.npy文件路径（相机→夹爪）
             bbox_selection: 边界框选择策略 ("smallest" 或 "largest")
             debug: 是否启用调试模式（保存所有中间文件）
+            use_yolo: 是否使用YOLO作为检测器
+            yolo_weights: YOLO权重路径（.pt）
         """
         self.output_dir = output_dir
         self.device = device
         self.save_pointcloud = save_pointcloud
         self.bbox_selection = bbox_selection
         self.debug = debug
-        
+        self.use_yolo = use_yolo
+        self.yolo_weights = yolo_weights
         # 创建输出目录（仅在debug模式下创建）
         if self.debug:
             self.rgb_dir = os.path.join(output_dir, "rgb")
@@ -86,6 +89,11 @@ class RealtimeSegmentation3D:
         # 初始化模型
         print("正在初始化AI模型...")
         self.sam_predictor, self.grounding_dino_model, self.processor = init_models(device)
+        
+        if self.use_yolo:
+            if not self.yolo_weights or not os.path.exists(self.yolo_weights):
+                print(f"[警告] 已启用YOLO检测，但未找到权重: {self.yolo_weights}，将回退Grounding DINO")
+                self.use_yolo = False
         
         # 初始化RealSense相机
         print("正在初始化RealSense相机...")
@@ -144,7 +152,7 @@ class RealtimeSegmentation3D:
                 [ 0.06027516, -0.99770511,  0.03084494],
                 [-0.02313391,  0.02949655,  0.99929714]
             ], dtype=np.float32)
-            t_default = np.array([[0.04], [0.065], [-0.22081495]], dtype=np.float32)
+            t_default = np.array([[0.04], [0.113], [-0.22081495]], dtype=np.float32)
             self.hand_eye_transform = np.eye(4, dtype=np.float32)
             self.hand_eye_transform[:3, :3] = R_default
             self.hand_eye_transform[:3, 3:4] = t_default
@@ -247,7 +255,10 @@ class RealtimeSegmentation3D:
         """
         # 检测（只选择一条鱼）
         detection_start = time.time()
-        boxes = self._detect_boxes(color_image)
+        if getattr(self, 'use_yolo', False):
+            boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.5, iou=0.45, imgsz=640)
+        else:
+            boxes = self._detect_boxes(color_image)
         detection_time = time.time() - detection_start
         self.timers['detection'].append(detection_time)
         print(f"⏱️  detection: {detection_time:.3f}s")
@@ -415,7 +426,157 @@ class RealtimeSegmentation3D:
             print("没有满足面积要求的边界框")
         
         return boxes
+
+    def detect_yolo(self, color_image, yolo_weights_path, conf=0.5, iou=0.45, imgsz=640, min_area=1000):
+        """
+        使用Ultralytics YOLO进行鱼的检测，返回与 _detect_boxes 相同格式的bbox列表（仅保留一个根据策略选择的框）。
+        
+        Args:
+            color_image: OpenCV BGR图像 (H,W,3)
+            yolo_weights_path: 训练好的YOLO权重 .pt 路径
+            conf: 置信度阈值
+            iou: NMS IOU 阈值
+            imgsz: 推理输入尺寸
+            min_area: 过滤最小面积（像素）
+        
+        Returns:
+            boxes: List[Tuple[x1, y1, x2, y2]] 按策略只返回一个框；若无则返回空列表
+        """
+        try:
+            from ultralytics import YOLO
+        except Exception as e:
+            print("[错误] 未找到 ultralytics，请先: pip install ultralytics")
+            print(e)
+            return []
+
+        # 加载模型（每次调用加载避免与其他依赖冲突；若频繁调用可外部缓存模型实例）
+        try:
+            model = YOLO(yolo_weights_path)
+        except Exception as e:
+            print(f"[错误] 加载YOLO权重失败: {yolo_weights_path} -> {e}")
+            return []
+
+        # YOLO支持直接传入numpy图像；确保为RGB
+        #image_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
+        try:
+            results = model.predict(
+                source=[color_image],
+                imgsz=imgsz,
+                conf=conf,
+                iou=iou,
+                verbose=False,
+                save=False
+            )
+        except Exception as e:
+            print(f"[错误] YOLO 推理失败: {e}")
+            return []
+
+        if not results:
+            return []
+
+        res = results[0]
+        boxes_np = None
+        try:
+            # xyxy (N,4)
+            boxes_np = res.boxes.xyxy.cpu().numpy() if hasattr(res, 'boxes') and res.boxes is not None else None
+        except Exception:
+            boxes_np = None
+
+        if boxes_np is None or len(boxes_np) == 0:
+            return []
+
+        # 过滤面积、裁剪到图像范围
+        H, W = color_image.shape[0], color_image.shape[1]
+        valid_boxes = []
+        for xyxy in boxes_np:
+            x1, y1, x2, y2 = [int(round(v)) for v in xyxy[:4].tolist()]
+            x1 = max(0, min(x1, W - 1))
+            y1 = max(0, min(y1, H - 1))
+            x2 = max(0, min(x2, W - 1))
+            y2 = max(0, min(y2, H - 1))
+            area = max(0, x2 - x1) * max(0, y2 - y1)
+            if area > min_area:
+                valid_boxes.append(((x1, y1, x2, y2), area))
+
+        boxes = []
+        if valid_boxes:
+            # 根据与 _detect_boxes 相同策略选择一个框
+            if self.bbox_selection == "smallest":
+                selected_box = min(valid_boxes, key=lambda x: x[1])
+                selection_type = "面积最小的"
+            elif self.bbox_selection == "largest":
+                selected_box = max(valid_boxes, key=lambda x: x[1])
+                selection_type = "面积最大的"
+            else:
+                selected_box = min(valid_boxes, key=lambda x: x[1])
+                selection_type = "面积最小的"
+                print(f"警告: 未知的选择策略 '{self.bbox_selection}'，使用默认策略 'smallest'")
+            boxes.append(selected_box[0])
+            print(f"[YOLO] 检测到 {len(valid_boxes)} 个候选框，选择{selection_type}进行抓取，面积: {selected_box[1]} 像素")
+            print(f"[YOLO] 选择的鱼位置: {selected_box[0]}")
+        else:
+            print("[YOLO] 没有满足面积要求的边界框")
+
+        return boxes
     
+    def detect_yolo_all(self, color_image, yolo_weights_path, conf=0.5, iou=0.45, imgsz=640):
+        """
+        使用Ultralytics YOLO对单帧进行推理，返回所有检测到的bbox（不做面积过滤与单框选择）。
+        返回：List[Tuple[int,int,int,int,float,int]] -> (x1,y1,x2,y2,conf,cls)
+        """
+        try:
+            from ultralytics import YOLO
+        except Exception as e:
+            print("[错误] 未找到 ultralytics，请先: pip install ultralytics")
+            print(e)
+            return []
+
+        # 加载模型（简化为每次加载；如需优化可在外部缓存）
+        try:
+            model = YOLO(yolo_weights_path)
+        except Exception as e:
+            print(f"[错误] 加载YOLO权重失败: {yolo_weights_path} -> {e}")
+            return []
+
+        # BGR -> RGB
+        #image_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
+        try:
+            results = model.predict(
+                source=[color_image],
+                imgsz=imgsz,
+                conf=conf,
+                iou=iou,
+                device=(0 if self.device == 'cuda' else 'cpu'),
+                verbose=False,
+                save=False,
+            )
+        except Exception as e:
+            print(f"[错误] YOLO 推理失败: {e}")
+            return []
+
+        if not results:
+            print("[YOLO] 无检测结果")
+            return []
+
+        res = results[0]
+        if not hasattr(res, 'boxes') or res.boxes is None or res.boxes.shape[0] == 0:
+            print("[YOLO] boxes 为空")
+            return []
+
+        xyxy = res.boxes.xyxy.cpu().numpy()  # (N,4)
+        conf_arr = res.boxes.conf.cpu().numpy() if hasattr(res.boxes, 'conf') else None
+        cls_arr = res.boxes.cls.cpu().numpy() if hasattr(res.boxes, 'cls') else None
+
+        all_boxes = []
+        for i, b in enumerate(xyxy):
+            x1, y1, x2, y2 = [int(round(v)) for v in b[:4].tolist()]
+            conf_v = float(conf_arr[i]) if conf_arr is not None else 0.0
+            cls_v = int(cls_arr[i]) if cls_arr is not None else -1
+            all_boxes.append((x1, y1, x2, y2, conf_v, cls_v))
+
+        print(f"[YOLO] 检测到 {len(all_boxes)} 个框（conf>={conf}）：前3个: {all_boxes[:3]}")
+        return all_boxes
+
     def dump_detections(self, color_image):
         """
         将检测到的目标裁剪并保存到 detection/ 目录
@@ -888,6 +1049,10 @@ def main():
                       help='边界框选择策略: smallest(选择面积最小的鱼) 或 largest(选择面积最大的鱼) (默认: largest)')
     parser.add_argument('--debug', action='store_true',
                       help='启用调试模式，保存所有中间文件（RGB、深度、检测、分割、点云）')
+    parser.add_argument('--use_yolo', action='store_true',
+                      help='使用YOLO作为检测器（替代Grounding DINO）')
+    parser.add_argument('--yolo_weights', type=str, default=None,
+                      help='YOLO权重文件(.pt)路径（与 --use_yolo 搭配使用）')
     
     args = parser.parse_args()
     
@@ -900,7 +1065,9 @@ def main():
             intrinsics_file=args.intrinsics_file,
             hand_eye_file=args.hand_eye_file,
             bbox_selection=args.bbox_selection,
-            debug=args.debug
+            debug=args.debug,
+            use_yolo=args.use_yolo,
+            yolo_weights=args.yolo_weights
         )
         
         # 运行实时处理
