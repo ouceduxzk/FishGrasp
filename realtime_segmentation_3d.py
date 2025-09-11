@@ -44,7 +44,7 @@ for _p in _extra_paths:
         pass
 
 class RealtimeSegmentation3D:
-    def __init__(self, output_dir, device="cpu", save_pointcloud=True, intrinsics_file=None, hand_eye_file=None, bbox_selection="smallest", debug=False, use_yolo=False, yolo_weights=None):
+    def __init__(self, output_dir, device="cpu", save_pointcloud=True, intrinsics_file=None, hand_eye_file=None, bbox_selection="highest_confidence", debug=False, use_yolo=False, yolo_weights=None):
         """
         初始化实时分割和3D点云生成器
         
@@ -54,7 +54,7 @@ class RealtimeSegmentation3D:
             save_pointcloud: 是否保存3D点云
             intrinsics_file: 相机内参JSON文件路径
             hand_eye_file: 手眼标定4x4齐次矩阵的.npy文件路径（相机→夹爪）
-            bbox_selection: 边界框选择策略 ("smallest" 或 "largest")
+            bbox_selection: 边界框选择策略 ("smallest" 或 "largest" 或 "highest_confidence")
             debug: 是否启用调试模式（保存所有中间文件）
             use_yolo: 是否使用YOLO作为检测器
             yolo_weights: YOLO权重路径（.pt）
@@ -270,9 +270,9 @@ class RealtimeSegmentation3D:
             det_vis = color_image.copy()
             if len(boxes) > 0:
                 # 只标记选中的鱼（绿色框）
-                x1, y1, x2, y2 = boxes[0]
+                x1, y1, x2, y2, confidence = boxes[0]
                 cv2.rectangle(det_vis, (x1, y1), (x2, y2), (0, 255, 0), 3)  # 绿色粗框表示选中的鱼
-                cv2.putText(det_vis, "SELECTED", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(det_vis, f"SELECTED (conf: {confidence:.2f})", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 
                 # 保存选中的鱼的裁剪图像
                 crop = color_image[y1:y2, x1:x2]
@@ -292,7 +292,7 @@ class RealtimeSegmentation3D:
             self.sam_predictor.set_image(image_rgb)
             
             # 只使用选中的边界框
-            x1, y1, x2, y2 = boxes[0]
+            x1, y1, x2, y2, confidence = boxes[0]
             boxes_tensor = torch.tensor([[x1, y1, x2, y2]], device=self.device)
             transformed_boxes = self.sam_predictor.transform.apply_boxes_torch(boxes_tensor, image_rgb.shape[:2])
 
@@ -429,7 +429,7 @@ class RealtimeSegmentation3D:
 
     def detect_yolo(self, color_image, yolo_weights_path, conf=0.5, iou=0.45, imgsz=640, min_area=1000):
         """
-        使用Ultralytics YOLO进行鱼的检测，返回与 _detect_boxes 相同格式的bbox列表（仅保留一个根据策略选择的框）。
+        使用Ultralytics YOLO进行鱼的检测，返回所有检测到的bbox。
         
         Args:
             color_image: OpenCV BGR图像 (H,W,3)
@@ -440,7 +440,7 @@ class RealtimeSegmentation3D:
             min_area: 过滤最小面积（像素）
         
         Returns:
-            boxes: List[Tuple[x1, y1, x2, y2]] 按策略只返回一个框；若无则返回空列表
+            boxes: List[Tuple[x1, y1, x2, y2, confidence]] 所有满足条件的bbox；若无则返回空列表
         """
         try:
             from ultralytics import YOLO
@@ -476,19 +476,22 @@ class RealtimeSegmentation3D:
 
         res = results[0]
         boxes_np = None
+        confidences = None
         try:
-            # xyxy (N,4)
+            # xyxy (N,4) 和 conf (N,)
             boxes_np = res.boxes.xyxy.cpu().numpy() if hasattr(res, 'boxes') and res.boxes is not None else None
+            confidences = res.boxes.conf.cpu().numpy() if hasattr(res, 'boxes') and res.boxes is not None else None
         except Exception:
             boxes_np = None
+            confidences = None
 
         if boxes_np is None or len(boxes_np) == 0:
             return []
 
-        # 过滤面积、裁剪到图像范围
+        # 过滤面积、裁剪到图像范围，同时保存置信度信息
         H, W = color_image.shape[0], color_image.shape[1]
         valid_boxes = []
-        for xyxy in boxes_np:
+        for i, xyxy in enumerate(boxes_np):
             x1, y1, x2, y2 = [int(round(v)) for v in xyxy[:4].tolist()]
             x1 = max(0, min(x1, W - 1))
             y1 = max(0, min(y1, H - 1))
@@ -496,24 +499,20 @@ class RealtimeSegmentation3D:
             y2 = max(0, min(y2, H - 1))
             area = max(0, x2 - x1) * max(0, y2 - y1)
             if area > min_area:
-                valid_boxes.append(((x1, y1, x2, y2), area))
+                confidence = confidences[i] if confidences is not None else 0.0
+                valid_boxes.append(((x1, y1, x2, y2), area, confidence))
 
         boxes = []
         if valid_boxes:
-            # 根据与 _detect_boxes 相同策略选择一个框
-            if self.bbox_selection == "smallest":
-                selected_box = min(valid_boxes, key=lambda x: x[1])
-                selection_type = "面积最小的"
-            elif self.bbox_selection == "largest":
-                selected_box = max(valid_boxes, key=lambda x: x[1])
-                selection_type = "面积最大的"
-            else:
-                selected_box = min(valid_boxes, key=lambda x: x[1])
-                selection_type = "面积最小的"
-                print(f"警告: 未知的选择策略 '{self.bbox_selection}'，使用默认策略 'smallest'")
-            boxes.append(selected_box[0])
-            print(f"[YOLO] 检测到 {len(valid_boxes)} 个候选框，选择{selection_type}进行抓取，面积: {selected_box[1]} 像素")
-            print(f"[YOLO] 选择的鱼位置: {selected_box[0]}")
+            # 返回所有检测到的bbox，包含置信度信息
+            for bbox_info in valid_boxes:
+                bbox_coords, area, confidence = bbox_info
+                # 返回格式: (x1, y1, x2, y2, confidence)
+                boxes.append((*bbox_coords, confidence))
+            
+            print(f"[YOLO] 检测到 {len(valid_boxes)} 个候选框，全部返回用于处理")
+            for i, (bbox_coords, area, confidence) in enumerate(valid_boxes):
+                print(f"[YOLO] 框 {i+1}: {bbox_coords}, 置信度: {confidence:.3f}, 面积: {area} 像素")
         else:
             print("[YOLO] 没有满足面积要求的边界框")
 
@@ -968,7 +967,7 @@ class RealtimeSegmentation3D:
                     # current_tcp: [x(mm), y(mm), z(mm), rx(rad), ry(rad), rz(rad)]
                     delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
                     # 调整Z：使用当前z与期望高度差（正值向上/向下依机器人定义，可按实际调试）
-                    z_offset = -(current_tcp[2] - hardcoded_height * 1000) + 200
+                    z_offset = -(current_tcp[2] - hardcoded_height * 1000) + 200 - 30
                     relative_move = [delta_base_xyz[0] +0,delta_base_xyz[1] +0, z_offset, 0, 0, 0]
                     
                     grasp_calc_time = time.time() - grasp_calc_start
@@ -985,13 +984,32 @@ class RealtimeSegmentation3D:
                     # 执行相对移动
                     #import pdb; pdb.set_trace()
                     self.robot.set_digital_output(0, 0, 1)
-                    self.robot.linear_move(relative_move, 1, True, 400)
+
+                    ret = self.robot.linear_move(relative_move, 1, True, 400)
+                    if ret != 0:
+                        print(f"机器人移动失败: {ret}")
+                        self.robot.linear_move(original_tcp, 0 , True, 400)
+                        self.robot.set_digital_output(0, 0, 0)
+                        continue
 
                     #  robot move up of 20 cm relatively 
-                    self.robot.linear_move([0, 0, 250, 0, 0, 0], 1 , True, 400)
+                    ret = self.robot.linear_move([0, 0, 250, 0, 0, 0], 1 , True, 400)
+                    if ret != 0:
+                        print(f"机器人移动失败: {ret}")
+                        self.robot.linear_move(original_tcp, 0 , True, 400)
+                        self.robot.set_digital_output(0, 0, 0)
+
+                        continue
+
                     # time.sleep(0.02)
                     # # robot move 35 cm in the y+ direction relatively 
-                    self.robot.linear_move([100, 350, 0, 0, 0, 0], 1 , True, 400)
+                    ret = self.robot.linear_move([100, 350, 0, 0, 0, 0], 1 , True, 400)
+                    if ret != 0:
+                        print(f"机器人移动失败: {ret}")
+                        self.robot.linear_move(original_tcp, 0 , True, 400)
+                        self.robot.set_digital_output(0, 0, 0)
+                        continue
+
                     #self.robot.linear_move(original_tcp, 0 , True, 400)
                     self.robot.set_digital_output(0, 0, 0)
                     #time.sleep(0.01)
@@ -1052,8 +1070,8 @@ def main():
                       help='相机内参JSON文件路径')
     parser.add_argument('--hand_eye_file', type=str, default=None,
                       help='手眼标定4x4齐次矩阵的.npy文件路径（相机→夹爪）')
-    parser.add_argument('--bbox_selection', type=str, default='largest',
-                      choices=['smallest', 'largest'],
+    parser.add_argument('--bbox_selection', type=str, default='highest_confidence',
+                      choices=['smallest', 'largest', 'highest_confidence'],
                       help='边界框选择策略: smallest(选择面积最小的鱼) 或 largest(选择面积最大的鱼) (默认: largest)')
     parser.add_argument('--debug', action='store_true',
                       help='启用调试模式，保存所有中间文件（RGB、深度、检测、分割、点云）')
