@@ -20,6 +20,7 @@ import argparse
 import os
 import sys
 import time
+import math
 import numpy as np
 import cv2
 import torch
@@ -862,11 +863,12 @@ class RealtimeSegmentation3D:
                 if not success:
                     continue
                 
+                self.frame_count = self.frame_count + 1
                 # 跳过前3帧，让相机稳定
-                if self.frame_count < 10:
-                    print(f"跳过第 {self.frame_count + 1} 帧，等待相机稳定...")
-                    self.frame_count += 1
-                    continue
+                # if self.frame_count < 10:
+                #     print(f"跳过第 {self.frame_count + 1} 帧，等待相机稳定...")
+                #     #self.frame_count += 1
+                #     continue
 
                 # 检测 + 分割 + 落盘
                 mask_vis, base_name = self.detect_and_segment_and_dump(color_image)
@@ -942,7 +944,7 @@ class RealtimeSegmentation3D:
                     print(f"夹爪坐标系点云质心: {centroid}")
                     
                     # 硬编码高度为0.05m
-                    hardcoded_height = 0.05  # 5cm
+                    hardcoded_height = 0.025  # 5cm
                     print(f"使用硬编码高度: {hardcoded_height:.3f}m")
 
                     # 获取当前机器人TCP位置
@@ -967,7 +969,7 @@ class RealtimeSegmentation3D:
                     # current_tcp: [x(mm), y(mm), z(mm), rx(rad), ry(rad), rz(rad)]
                     delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
                     # 调整Z：使用当前z与期望高度差（正值向上/向下依机器人定义，可按实际调试）
-                    z_offset = -(current_tcp[2] - hardcoded_height * 1000) + 200 - 30
+                    z_offset = -(current_tcp[2] - hardcoded_height * 1000) + 200 - 20
                     relative_move = [delta_base_xyz[0] +0,delta_base_xyz[1] +0, z_offset, 0, 0, 0]
                     
                     grasp_calc_time = time.time() - grasp_calc_start
@@ -985,44 +987,44 @@ class RealtimeSegmentation3D:
                     #import pdb; pdb.set_trace()
                     self.robot.set_digital_output(0, 0, 1)
 
-                    ret = self.robot.linear_move(relative_move, 1, True, 400)
-                    if ret != 0:
-                        print(f"机器人移动失败: {ret}")
-                        self.robot.linear_move(original_tcp, 0 , True, 400)
-                        self.robot.set_digital_output(0, 0, 0)
-                        continue
+                    ret = self.robot.linear_move(relative_move, 1, True, 500)
+                    # if ret != 0:
+                    #     print(f"机器人移动失败: {ret}")
+                    #     self.robot.linear_move(original_tcp, 0 , True, 400)
+                    #     self.robot.set_digital_output(0, 0, 0)
+                    #     continue
 
                     #  robot move up of 20 cm relatively 
-                    ret = self.robot.linear_move([0, 0, 250, 0, 0, 0], 1 , True, 400)
-                    if ret != 0:
-                        print(f"机器人移动失败: {ret}")
-                        self.robot.linear_move(original_tcp, 0 , True, 400)
-                        self.robot.set_digital_output(0, 0, 0)
+                    #  ret = self.robot.linear_move([current_tcp[0], current_tcp[1], current_tcp[2] -100, current_tcp[3], current_tcp[4], current_tcp[5]], 0, True, 400)
+                    # if ret != 0:
+                    #     print(f"机器人移动失败: {ret}")
+                    #     self.robot.linear_move(original_tcp, 0 , True, 400)
+                    #     self.robot.set_digital_output(0, 0, 0)
+                    #     continue
+                    self.robot.linear_move(original_tcp, 0 , True, 500)
 
-                        continue
+                    # 旋转基座90度 (Yaw轴旋转)
+                    # 90度 = π/2 弧度 ≈ 1.57 弧度
+                    rotation_angle = math.pi / 2  # 90度
+                    ret = self.robot.joint_move([-np.pi  * 0.6, 0, 0, 0, 0, 0], 1, True, 1)
+                    # if ret != 0:
+                    #     print(f"机器人旋转失败: {ret}")
+                    #     self.robot.linear_move(original_tcp, 0 , True, 400)
+                    #     self.robot.set_digital_output(0, 0, 0)
+                    #     continue
 
-                    # time.sleep(0.02)
-                    # # robot move 35 cm in the y+ direction relatively 
-                    ret = self.robot.linear_move([100, 350, 0, 0, 0, 0], 1 , True, 400)
-                    if ret != 0:
-                        print(f"机器人移动失败: {ret}")
-                        self.robot.linear_move(original_tcp, 0 , True, 400)
-                        self.robot.set_digital_output(0, 0, 0)
-                        continue
-
-                    #self.robot.linear_move(original_tcp, 0 , True, 400)
                     self.robot.set_digital_output(0, 0, 0)
+                    time.sleep(0.4)
+                    ret = self.robot.joint_move([np.pi  * 0.6, 0, 0, 0, 0, 0], 1, True, 2)
+                
                     #time.sleep(0.01)
                     #robot move back to the original position
-                    self.robot.linear_move(original_tcp, 0 , True, 400)
-                    
-                    #self.robot.logout()
-                    #exit()
-                    
+                    self.robot.linear_move(original_tcp, 0 , True, 500)
+                   
                     robot_movement_time = time.time() - robot_movement_start
                     self.timers['robot_movement'].append(robot_movement_time)
                     print(f"⏱️  robot_movement: {robot_movement_time:.3f}s")
-
+            
                 else:
                     print("点云为空，跳过机器人控制")
 
@@ -1031,6 +1033,10 @@ class RealtimeSegmentation3D:
                 self.timers['total_cycle'].append(cycle_time)
                 print(f"⏱️  total_cycle: {cycle_time:.3f}s")
                 print("-" * 50)
+ 
+                # self.robot.logout()
+                # exit()
+                
 
         except KeyboardInterrupt:
             print("\n用户中断处理")
