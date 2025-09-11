@@ -9,7 +9,7 @@ Ultralytics YOLO 训练脚本
 
 示例：
   python3 detection/train_yolo.py \
-    --data ./datasets/new_data_98_dataset/dataset.yaml \
+    --data ./datasets/l0_9.11/dataset.yaml \
     --model yolov8s.pt \
     --epochs 100 \
     --batch 16 \
@@ -143,7 +143,7 @@ def main():
     if not args.name:
         model_stem = os.path.splitext(os.path.basename(args.model))[0]
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.name = f"{model_stem}_{timestamp}"
+        args.name = f"{model_stem}_{args.aug}_{timestamp}"
 
     os.makedirs(args.project, exist_ok=True)
 

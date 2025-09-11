@@ -11,10 +11,11 @@ set -euo pipefail
 #
 # 用法示例：
 #   bash detection/prepare_dataset.sh \
-#     --source ./data \
-#     --out ./datasets/fish_keypoints \
+#     --source ./raw_9.9_sum \
+#     --out ./datasets/l0_9.9_sum \
 #     --train 0.8 --val 0.1 --test 0.1 \
 #     --copy
+#   bash detection/prepare_dataset.sh --source ./raw_9.10 --out ./datasets/l0_9.10  --train 0.8 --val 0.1 --test 0.1 --copy
 #
 # 说明：
 #   --source  根目录，要求包含 images/ 与 labels/ 子目录（逐图json场景），或包含COCO json
