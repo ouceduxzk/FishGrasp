@@ -955,11 +955,15 @@ class RealtimeSegmentation3D:
         print(f"当前RPY: {np.degrees(current_rpy)} 度")
         print(f"目标RPY: {np.degrees(target_rpy)} 度")
         
+
+        delta_tool_mm = [centroid[0] * 1000, centroid[1] * 1000, centroid[2] * 1000]
+        delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
+
         # 构建抓取姿态
         grasp_pose = np.array([
-            centroid[0] * 1000,  # 转换为毫米
-            centroid[1] * 1000,
-            -centroid[2] * 1000, # because the z is pointing down in the gripper coordinate system
+            delta_base_xyz[0],  # 转换为毫米
+            delta_base_xyz[1],
+            delta_base_xyz[2] -25 , # move a bit deeper  to make sure the gripper is attached with the object
             target_rpy[0],       # 保持弧度
             target_rpy[1],
             target_rpy[2]
@@ -1180,29 +1184,30 @@ class RealtimeSegmentation3D:
                     
                     # 计算考虑法向量的抓取姿态
                     grasp_pose, normal_info = self.calculate_grasp_pose_with_normal(points_gripper, current_tcp)
+                    #normal_info = None 
+                
+                    print("🎯 法向量对齐抓取:")
+                    print(f"  质心: {normal_info['centroid']}")
+                    print(f"  法向量: {normal_info['normal']}")
+                    print(f"  RPY变化: {np.degrees(normal_info['rpy_change'])} 度")
                     
-                    if normal_info is not None:
-                        print("🎯 法向量对齐抓取:")
-                        print(f"  质心: {normal_info['centroid']}")
-                        print(f"  法向量: {normal_info['normal']}")
-                        print(f"  RPY变化: {np.degrees(normal_info['rpy_change'])} 度")
-                        
-                        # 计算相对移动（包含姿态调整）
-                        # 在夹爪坐标系中，位置变化就是目标位置（因为当前TCP在原点）
-                        position_change = grasp_pose[:3]  # 目标物体在夹爪坐标系中的位置
-                        position_change
+                    # 计算相对移动（包含姿态调整）
+                    # 在夹爪坐标系中，位置变化就是目标位置（因为当前TCP在原点）
+                    position_change = grasp_pose[:3]  # 目标物体在夹爪坐标系中的位置
 
+                    # 姿态变化：从当前RPY到目标RPY
+                    orientation_change = grasp_pose[3:6] - current_tcp[3:6]
+                    orientation_change[0] = 0
+                    orientation_change[1] = 0
+                    orientation_change[2] = 0
 
-                        # 姿态变化：从当前RPY到目标RPY
-                        orientation_change = grasp_pose[3:6] - current_tcp[3:6]
-                        
-                        # 组合相对移动
-                        relative_move = np.concatenate([position_change, orientation_change])
-                        
-                        print(f"位置变化: {position_change} mm")
-                        print(f"姿态变化: {np.degrees(orientation_change)} 度")
-                        
-                    else:
+                    # 组合相对移动
+                    relative_move = np.concatenate([orientation_change * position_change, orientation_change])
+                    
+                    print(f"位置变化: {position_change} mm")
+                    print(f"姿态变化: {np.degrees(orientation_change)} 度")
+                    
+                    if True:
                         # 回退到简单质心抓取
                         print("⚠️  法向量计算失败，使用简单质心抓取")
                         centroid = np.mean(points_gripper, axis=0)
@@ -1214,7 +1219,7 @@ class RealtimeSegmentation3D:
                         # 计算相对移动：从当前TCP位置移动到夹爪坐标系中的目标位置
                         delta_tool_mm = [center_gripper_mm[0], center_gripper_mm[1], center_gripper_mm[2]]
                         delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
-                        z_offset = -delta_tool_mm[2] 
+                        z_offset = -delta_tool_mm[2] -25
                         relative_move = [delta_base_xyz[0], delta_base_xyz[1], z_offset, 0, 0, 0]
                     
                     grasp_calc_time = time.time() - grasp_calc_start
@@ -1229,9 +1234,9 @@ class RealtimeSegmentation3D:
                     
                     # 执行相对移动
                     #import pdb; pdb.set_trace()
-                    #self.robot.set_digital_output(0, 0, 1)
+                    self.robot.set_digital_output(0, 0, 1)
 
-                    ret = self.robot.linear_move(relative_move, 1, True, 50)
+                    ret = self.robot.linear_move(relative_move, 1, True, 500)
                     # if ret != 0:
                     #     print(f"机器人移动失败: {ret}")
                     #     self.robot.linear_move(original_tcp, 0 , True, 400)
@@ -1247,18 +1252,15 @@ class RealtimeSegmentation3D:
                     #     continue
                     self.robot.linear_move(original_tcp, 0 , True, 500)
 
-                    # 旋转基座90度 (Yaw轴旋转)
-                    # 90度 = π/2 弧度 ≈ 1.57 弧度
-                    # rotation_angle = math.pi / 2  # 90度
-                    # ret = self.robot.joint_move([-np.pi  * 0.6, 0, 0, 0, 0, 0], 1, True, 1)
+                    ret = self.robot.joint_move([-np.pi  * 0.6, 0, 0, 0, 0, 0], 1, True, 1)
 
-                    # self.robot.set_digital_output(0, 0, 0)
-                    # time.sleep(0.4)
-                    # ret = self.robot.joint_move([np.pi  * 0.6, 0, 0, 0, 0, 0], 1, True, 2)
+                    self.robot.set_digital_output(0, 0, 0)
+                    time.sleep(0.4)
+                    ret = self.robot.joint_move([np.pi  * 0.6, 0, 0, 0, 0, 0], 1, True, 2)
                 
-                    # #time.sleep(0.01)
-                    # #robot move back to the original position
-                    # self.robot.linear_move(original_tcp, 0 , True, 500)
+                    #time.sleep(0.01)
+                    #robot move back to the original position
+                    self.robot.linear_move(original_tcp, 0 , True, 500)
                    
                     robot_movement_time = time.time() - robot_movement_start
                     self.timers['robot_movement'].append(robot_movement_time)
