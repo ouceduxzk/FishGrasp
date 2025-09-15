@@ -166,6 +166,8 @@ class RealtimeSegmentation3D:
         import jkrc 
         self.robot = jkrc.RC("192.168.80.116")
         self.robot.login()   
+        self.robot.set_digital_output(0, 0, 0)
+
     
     def time_step(self, step_name):
         """计时器装饰器，用于测量各个步骤的时间"""
@@ -249,10 +251,153 @@ class RealtimeSegmentation3D:
             print(f"捕获帧时出错: {e}")
             return None, None, False
     
+    # write seperate function to do detection and segmentation togther but segmentation is done for all the objects, 
+    # and then we can select the  grasp object based on the distance of camera,.
+    def detect_and_segment_and_dump_all(self, color_image, depth_image):
+        """
+        检测所有候选鱼，分别分割并计算点云质心深度，选取离相机最近的一个。
+
+        Args:
+            color_image: BGR 图像 (H,W,3)
+            depth_image: 深度图 (毫米, uint16)
+
+        Returns:
+            mask_np: 选中鱼的单通道uint8掩码（0/255），若失败返回None
+            base_name: 文件基名字符串，若失败返回None
+        """
+        # 1) 检测所有候选框
+        detection_start = time.time()
+        if getattr(self, 'use_yolo', False):
+            # YOLO 路径：detect_yolo 已返回所有满足条件的框 (x1,y1,x2,y2,conf)
+            boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.25, iou=0.45, imgsz=640)
+        else:
+            # GroundingDINO 路径：复用 _detect_boxes 的实现逻辑但收集全部有效框
+            image_pil = Image.fromarray(cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB))
+            text_prompt = "fish. crab. marine animal"
+            inputs = self.processor(images=image_pil, text=text_prompt, return_tensors="pt").to(self.device)
+            with torch.no_grad():
+                outputs = self.grounding_dino_model(**inputs)
+            H, W = color_image.shape[0], color_image.shape[1]
+            results = self.processor.post_process_grounded_object_detection(
+                outputs,
+                inputs.input_ids,
+                text_threshold=0.3,
+                target_sizes=[image_pil.size[::-1]]
+            )
+            result = results[0]
+            boxes = []
+            if len(result.get("boxes", [])) > 0:
+                for box in result["boxes"]:
+                    x1, y1, x2, y2 = [int(c) for c in box.tolist()]
+                    x1 = max(0, min(x1, W - 1))
+                    y1 = max(0, min(y1, H - 1))
+                    x2 = max(0, min(x2, W - 1))
+                    y2 = max(0, min(y2, H - 1))
+                    area = max(0, x2 - x1) * max(0, y2 - y1)
+                    if area > 1000:
+                        # 为了统一，与 YOLO 一样附上一个伪置信度 1.0
+                        boxes.append((x1, y1, x2, y2, 1.0))
+        detection_time = time.time() - detection_start
+        self.timers['detection'].append(detection_time)
+        print(f"⏱️  detection(all): {detection_time:.3f}s  候选数: {len(boxes) if boxes else 0}")
+
+        if not boxes:
+            print("未检测到目标，跳过分割。")
+            return None, None
+
+        # 2) 逐个候选框进行分割，并计算点云质心深度
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        base_name = f"frame_{self.frame_count:06d}_{timestamp}"
+
+        image_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
+        self.sam_predictor.set_image(image_rgb)
+
+        best_idx = -1
+        best_depth_m = float('inf')
+        best_mask = None
+
+        segmentation_start = time.time()
+        for i, b in enumerate(boxes):
+            x1, y1, x2, y2 = b[:4]
+            boxes_tensor = torch.tensor([[x1, y1, x2, y2]], device=self.device)
+            transformed_boxes = self.sam_predictor.transform.apply_boxes_torch(boxes_tensor, image_rgb.shape[:2])
+
+            try:
+                masks, scores, logits = self.sam_predictor.predict_torch(
+                    point_coords=None,
+                    point_labels=None,
+                    boxes=transformed_boxes,
+                    multimask_output=False
+                )
+            except Exception as e:
+                print(f"[分割] 候选框 {i} 预测失败: {e}")
+                continue
+
+            if masks.shape[0] == 0 or masks.shape[1] == 0:
+                print(f"[分割] 候选框 {i} 未生成掩码")
+                continue
+
+            m_bool = masks[0][0].detach().cpu().numpy().astype(np.uint8)
+            mask_np = m_bool * 255
+            # 限制在 bbox 内
+            restricted_mask = np.zeros_like(mask_np, dtype=np.uint8)
+            restricted_mask[y1:y2, x1:x2] = mask_np[y1:y2, x1:x2]
+            mask_np = restricted_mask
+
+            # 计算点云并求质心深度（相机坐标系，单位米）
+            mask_bool = (mask_np > 0)
+            if not np.any(mask_bool):
+                print(f"[分割] 候选框 {i} 掩码为空，跳过")
+                continue
+
+            points, colors = self.generate_pointcloud(color_image, depth_image, mask_bool)
+            if points is None or len(points) == 0:
+                print(f"[点云] 候选框 {i} 点云为空，跳过")
+                continue
+
+            centroid = np.mean(points, axis=0)  # (x,y,z) in meters (cam frame)
+            depth_m = float(centroid[2])
+            print(f"候选框 {i} 质心深度: {depth_m:.4f} m  bbox=({x1},{y1},{x2},{y2})")
+
+            # 记录调试输出
+            if self.debug:
+                cv2.imwrite(os.path.join(self.segmentation_dir, f"{base_name}_cand{i}_mask.png"), mask_np)
+                det_vis = color_image.copy()
+                cv2.rectangle(det_vis, (x1, y1), (x2, y2), (0, 255, 255), 2)
+                cv2.putText(det_vis, f"cand {i}", (x1, max(0, y1-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+                cv2.imwrite(os.path.join(self.detection_dir, f"{base_name}_cand{i}_box.png"), det_vis)
+
+            if depth_m < best_depth_m:
+                best_depth_m = depth_m
+                best_mask = mask_np
+                best_idx = i
+
+        segmentation_time = time.time() - segmentation_start
+        self.timers['segmentation'].append(segmentation_time)
+        print(f"⏱️  segmentation(all): {segmentation_time:.3f}s")
+
+        if best_idx == -1 or best_mask is None:
+            print("分割/点云均失败，未选出候选")
+            return None, None
+
+        print(f"选择最近候选: idx={best_idx}, 深度={best_depth_m:.4f} m")
+
+        # 可视化最终选择
+        if self.debug:
+            colored = np.zeros_like(color_image)
+            colored[best_mask > 0] = [0, 255, 0]
+            vis = cv2.addWeighted(color_image, 1.0, colored, 0.4, 0)
+            vis_path = os.path.join(self.segmentation_dir, f"{base_name}_closest_overlay.png")
+            cv2.imwrite(vis_path, vis)
+
+        return best_mask, base_name
+
+
+
     def detect_and_segment_and_dump(self, color_image):
         """
-        本地完成检测->落盘->分割->落盘，返回用于显示的单通道uint8掩码（0/255）。
-        只选择一条鱼进行分割，无检测时返回None。
+        本地完成检测->分割 返回用于显示的单通道uint8掩码（0/255）。
+        based on confidence score,只选择一条鱼进行分割，无检测时返回None。
         """
         # 检测（只选择一条鱼）
         detection_start = time.time()
@@ -1097,14 +1242,10 @@ class RealtimeSegmentation3D:
                     continue
                 
                 self.frame_count = self.frame_count + 1
-                # 跳过前3帧，让相机稳定
-                # if self.frame_count < 10:
-                #     print(f"跳过第 {self.frame_count + 1} 帧，等待相机稳定...")
-                #     #self.frame_count += 1
-                #     continue
+               
 
-                # 检测 + 分割 + 落盘
-                mask_vis, base_name = self.detect_and_segment_and_dump(color_image)
+                # 检测 + 分割 + 落盘（最近目标选择）
+                mask_vis, base_name = self.detect_and_segment_and_dump_all(color_image, depth_image)
                 
                 # 保存RGB和深度图像（仅在debug模式下）
                 if self.debug and base_name is not None:
@@ -1281,6 +1422,7 @@ class RealtimeSegmentation3D:
 
         except KeyboardInterrupt:
             print("\n用户中断处理")
+            self.robot.set_digital_output(0, 0, 0)
         except Exception as e:
             print(f"处理过程中出错: {e}")
         finally:
