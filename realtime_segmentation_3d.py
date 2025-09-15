@@ -944,8 +944,8 @@ class RealtimeSegmentation3D:
                     print(f"夹爪坐标系点云质心: {centroid}")
                     
                     # 硬编码高度为0.05m
-                    hardcoded_height = 0.025  # 5cm
-                    print(f"使用硬编码高度: {hardcoded_height:.3f}m")
+                    # hardcoded_height = 0.025  # 5cm
+                    # print(f"使用硬编码高度: {hardcoded_height:.3f}m")
 
                     # 获取当前机器人TCP位置
                     tcp_result = self.robot.get_tcp_position()
@@ -965,12 +965,15 @@ class RealtimeSegmentation3D:
                     # 注意：夹爪坐标系中的正z方向可能需要根据实际情况调整
                     # 将工具系(夹爪)位移转换为基座系位移，以避免x/y方向误差
                     # 工具系位移：让TCP从当前到达对象中心（忽略姿态变化）
-                    delta_tool_mm = [center_gripper_mm[0] , center_gripper_mm[1], hardcoded_height* 1000]
+
+
+                    #import pdb; pdb.set_trace()
+                    delta_tool_mm = [center_gripper_mm[0] , center_gripper_mm[1], center_gripper_mm[2]]
                     # current_tcp: [x(mm), y(mm), z(mm), rx(rad), ry(rad), rz(rad)]
                     delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
                     # 调整Z：使用当前z与期望高度差（正值向上/向下依机器人定义，可按实际调试）
-                    z_offset = -(current_tcp[2] - hardcoded_height * 1000) + 200 - 20
-                    relative_move = [delta_base_xyz[0] +0,delta_base_xyz[1] +0, z_offset, 0, 0, 0]
+                    z_offset = - delta_tool_mm[2]
+                    relative_move = [delta_base_xyz[0],delta_base_xyz[1], z_offset, 0, 0, 0]
                     
                     grasp_calc_time = time.time() - grasp_calc_start
                     self.timers['grasp_calculation'].append(grasp_calc_time)
@@ -985,9 +988,9 @@ class RealtimeSegmentation3D:
                     
                     # 执行相对移动
                     #import pdb; pdb.set_trace()
-                    self.robot.set_digital_output(0, 0, 1)
+                    #self.robot.set_digital_output(0, 0, 1)
 
-                    ret = self.robot.linear_move(relative_move, 1, True, 500)
+                    ret = self.robot.linear_move(relative_move, 1, True, 50)
                     # if ret != 0:
                     #     print(f"机器人移动失败: {ret}")
                     #     self.robot.linear_move(original_tcp, 0 , True, 400)
@@ -1005,21 +1008,16 @@ class RealtimeSegmentation3D:
 
                     # 旋转基座90度 (Yaw轴旋转)
                     # 90度 = π/2 弧度 ≈ 1.57 弧度
-                    rotation_angle = math.pi / 2  # 90度
-                    ret = self.robot.joint_move([-np.pi  * 0.6, 0, 0, 0, 0, 0], 1, True, 1)
-                    # if ret != 0:
-                    #     print(f"机器人旋转失败: {ret}")
-                    #     self.robot.linear_move(original_tcp, 0 , True, 400)
-                    #     self.robot.set_digital_output(0, 0, 0)
-                    #     continue
+                    # rotation_angle = math.pi / 2  # 90度
+                    # ret = self.robot.joint_move([-np.pi  * 0.6, 0, 0, 0, 0, 0], 1, True, 1)
 
-                    self.robot.set_digital_output(0, 0, 0)
-                    time.sleep(0.4)
-                    ret = self.robot.joint_move([np.pi  * 0.6, 0, 0, 0, 0, 0], 1, True, 2)
+                    # self.robot.set_digital_output(0, 0, 0)
+                    # time.sleep(0.4)
+                    # ret = self.robot.joint_move([np.pi  * 0.6, 0, 0, 0, 0, 0], 1, True, 2)
                 
-                    #time.sleep(0.01)
-                    #robot move back to the original position
-                    self.robot.linear_move(original_tcp, 0 , True, 500)
+                    # #time.sleep(0.01)
+                    # #robot move back to the original position
+                    # self.robot.linear_move(original_tcp, 0 , True, 500)
                    
                     robot_movement_time = time.time() - robot_movement_start
                     self.timers['robot_movement'].append(robot_movement_time)
