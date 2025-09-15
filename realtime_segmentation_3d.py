@@ -959,7 +959,7 @@ class RealtimeSegmentation3D:
         grasp_pose = np.array([
             centroid[0] * 1000,  # 转换为毫米
             centroid[1] * 1000,
-            centroid[2] * 1000,
+            -centroid[2] * 1000, # because the z is pointing down in the gripper coordinate system
             target_rpy[0],       # 保持弧度
             target_rpy[1],
             target_rpy[2]
@@ -1190,7 +1190,9 @@ class RealtimeSegmentation3D:
                         # 计算相对移动（包含姿态调整）
                         # 在夹爪坐标系中，位置变化就是目标位置（因为当前TCP在原点）
                         position_change = grasp_pose[:3]  # 目标物体在夹爪坐标系中的位置
-                        
+                        position_change
+
+
                         # 姿态变化：从当前RPY到目标RPY
                         orientation_change = grasp_pose[3:6] - current_tcp[3:6]
                         
@@ -1206,17 +1208,13 @@ class RealtimeSegmentation3D:
                         centroid = np.mean(points_gripper, axis=0)
                         print(f"夹爪坐标系点云质心: {centroid}")
                         
-                        # 硬编码高度为0.025m
-                        hardcoded_height = 0.025  # 2.5cm
-                        print(f"使用硬编码高度: {hardcoded_height:.3f}m")
-                        
                         # 夹爪坐标系中的目标中心点（转换为毫米）
                         center_gripper_mm = centroid * 1000
                         
                         # 计算相对移动：从当前TCP位置移动到夹爪坐标系中的目标位置
-                        delta_tool_mm = [center_gripper_mm[0], center_gripper_mm[1], hardcoded_height * 1000]
+                        delta_tool_mm = [center_gripper_mm[0], center_gripper_mm[1], center_gripper_mm[2]]
                         delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
-                        z_offset = -(current_tcp[2] - hardcoded_height * 1000) + 200 - 20
+                        z_offset = -delta_tool_mm[2] 
                         relative_move = [delta_base_xyz[0], delta_base_xyz[1], z_offset, 0, 0, 0]
                     
                     grasp_calc_time = time.time() - grasp_calc_start
