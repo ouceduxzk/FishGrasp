@@ -746,6 +746,235 @@ class RealtimeSegmentation3D:
         }
         
         return bbox_info
+
+    def calculate_surface_normal(self, points, method='pca'):
+        """
+        计算点云质心处的表面法向量
+        
+        Args:
+            points: 点云坐标 (N, 3)
+            method: 法向量计算方法 ('pca', 'plane_fitting', 'nearest_neighbors')
+            
+        Returns:
+            normal: 法向量 (3,) 单位向量
+            centroid: 质心坐标 (3,)
+        """
+        if points.size == 0 or len(points) < 3:
+            return np.array([0, 0, 1]), np.array([0, 0, 0])
+        
+        centroid = np.mean(points, axis=0)
+        
+        if method == 'pca':
+            # 使用PCA计算法向量
+            try:
+                from sklearn.decomposition import PCA
+                pca = PCA(n_components=3)
+                pca.fit(points)
+                # 最小特征值对应的特征向量就是法向量
+                normal = pca.components_[2]  # 第三个主成分（最小方差方向）
+            except ImportError:
+                print("sklearn未安装，使用简单平面拟合")
+                return self._simple_plane_fitting(points, centroid)
+        
+        elif method == 'plane_fitting':
+            return self._simple_plane_fitting(points, centroid)
+        
+        elif method == 'nearest_neighbors':
+            return self._nearest_neighbors_normal(points, centroid)
+        
+        else:
+            raise ValueError(f"未知的法向量计算方法: {method}")
+        
+        # 确保法向量指向正确的方向（通常指向相机方向）
+        # 如果法向量的z分量为负，则翻转方向
+        if normal[2] < 0:
+            normal = -normal
+        
+        # 归一化
+        normal = normal / np.linalg.norm(normal)
+        
+        return normal, centroid
+
+    def _simple_plane_fitting(self, points, centroid):
+        """
+        使用简单平面拟合计算法向量
+        """
+        # 将点云中心化
+        centered_points = points - centroid
+        
+        # 构建协方差矩阵
+        cov_matrix = np.cov(centered_points.T)
+        
+        # 计算特征值和特征向量
+        eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
+        
+        # 最小特征值对应的特征向量就是法向量
+        normal = eigenvectors[:, 0]  # 最小特征值对应的特征向量
+        
+        # 确保法向量指向正确的方向
+        if normal[2] < 0:
+            normal = -normal
+        
+        # 归一化
+        normal = normal / np.linalg.norm(normal)
+        
+        return normal, centroid
+
+    def _nearest_neighbors_normal(self, points, centroid, k=20):
+        """
+        使用最近邻方法计算法向量
+        """
+        # 计算每个点到质心的距离
+        distances = np.linalg.norm(points - centroid, axis=1)
+        
+        # 找到最近的k个点
+        nearest_indices = np.argsort(distances)[:k]
+        nearest_points = points[nearest_indices]
+        
+        # 使用这些最近邻点进行平面拟合
+        return self._simple_plane_fitting(nearest_points, centroid)
+
+    def normal_to_rpy(self, normal_vector, current_rpy=None):
+        """
+        将法向量转换为机器人末端姿态的RPY角度
+        
+        Args:
+            normal_vector: 法向量 (3,) 单位向量，表示期望的Z轴方向
+            current_rpy: 当前RPY角度 [rx, ry, rz] (可选，用于平滑过渡)
+            
+        Returns:
+            target_rpy: 目标RPY角度 [rx, ry, rz]
+        """
+        # 期望的Z轴方向（法向量）
+        z_target = normal_vector / np.linalg.norm(normal_vector)
+        
+        # 定义参考坐标系（可以根据需要调整）
+        # 这里假设X轴指向机器人前方，Y轴指向机器人左侧
+        x_ref = np.array([1, 0, 0])  # 参考X轴
+        y_ref = np.array([0, 1, 0])  # 参考Y轴
+        
+        # 计算新的坐标系
+        # Z轴 = 法向量
+        z_new = z_target
+        
+        # X轴 = 参考X轴在垂直于Z轴的平面上的投影
+        x_new = x_ref - np.dot(x_ref, z_new) * z_new
+        x_new = x_new / np.linalg.norm(x_new)
+        
+        # Y轴 = Z轴 × X轴
+        y_new = np.cross(z_new, x_new)
+        y_new = y_new / np.linalg.norm(y_new)
+        
+        # 构建旋转矩阵
+        R = np.column_stack([x_new, y_new, z_new])
+        
+        # 将旋转矩阵转换为RPY角度
+        # 使用ZYX欧拉角顺序（Roll-Pitch-Yaw）
+        sy = np.sqrt(R[0, 0] * R[0, 0] + R[1, 0] * R[1, 0])
+        
+        singular = sy < 1e-6
+        
+        if not singular:
+            rx = np.arctan2(R[2, 1], R[2, 2])  # Roll
+            ry = np.arctan2(-R[2, 0], sy)      # Pitch
+            rz = np.arctan2(R[1, 0], R[0, 0])  # Yaw
+        else:
+            rx = np.arctan2(-R[1, 2], R[1, 1])  # Roll
+            ry = np.arctan2(-R[2, 0], sy)       # Pitch
+            rz = 0                               # Yaw
+        
+        target_rpy = np.array([rx, ry, rz])
+        
+        # 如果提供了当前RPY，进行平滑过渡
+        if current_rpy is not None:
+            target_rpy = self._smooth_rpy_transition(current_rpy, target_rpy)
+        
+        return target_rpy
+
+    def _smooth_rpy_transition(self, current_rpy, target_rpy, max_change=0.1):
+        """
+        平滑RPY角度过渡，避免突变
+        
+        Args:
+            current_rpy: 当前RPY角度
+            target_rpy: 目标RPY角度
+            max_change: 单次最大变化量（弧度）
+            
+        Returns:
+            smoothed_rpy: 平滑后的RPY角度
+        """
+        current_rpy = np.array(current_rpy)
+        target_rpy = np.array(target_rpy)
+        
+        # 计算角度差
+        diff = target_rpy - current_rpy
+        
+        # 处理角度跳跃（±π）
+        for i in range(3):
+            if diff[i] > np.pi:
+                diff[i] -= 2 * np.pi
+            elif diff[i] < -np.pi:
+                diff[i] += 2 * np.pi
+        
+        # 限制变化量
+        for i in range(3):
+            if abs(diff[i]) > max_change:
+                diff[i] = np.sign(diff[i]) * max_change
+        
+        # 计算平滑后的角度
+        smoothed_rpy = current_rpy + diff
+        
+        return smoothed_rpy
+
+    def calculate_grasp_pose_with_normal(self, points_gripper, current_tcp):
+        """
+        计算考虑法向量的抓取姿态
+        
+        Args:
+            points_gripper: 夹爪坐标系中的点云 (N, 3)
+            current_tcp: 当前TCP位置 [x, y, z, rx, ry, rz]
+            
+        Returns:
+            grasp_pose: 抓取姿态 [x, y, z, rx, ry, rz]
+            normal_info: 法向量信息字典
+        """
+        if points_gripper.size == 0 or len(points_gripper) < 3:
+            print("点云点数不足，无法计算法向量")
+            return current_tcp, None
+        
+        # 计算质心和法向量
+        normal, centroid = self.calculate_surface_normal(points_gripper, method='pca')
+        
+        print(f"质心坐标: {centroid}")
+        print(f"法向量: {normal}")
+        
+        # 将法向量转换为RPY角度
+        current_rpy = current_tcp[3:6]
+        target_rpy = self.normal_to_rpy(normal, current_rpy)
+        
+        print(f"当前RPY: {np.degrees(current_rpy)} 度")
+        print(f"目标RPY: {np.degrees(target_rpy)} 度")
+        
+        # 构建抓取姿态
+        grasp_pose = np.array([
+            centroid[0] * 1000,  # 转换为毫米
+            centroid[1] * 1000,
+            centroid[2] * 1000,
+            target_rpy[0],       # 保持弧度
+            target_rpy[1],
+            target_rpy[2]
+        ])
+        
+        # 法向量信息
+        normal_info = {
+            'centroid': centroid,
+            'normal': normal,
+            'current_rpy': current_rpy,
+            'target_rpy': target_rpy,
+            'rpy_change': target_rpy - current_rpy
+        }
+        
+        return grasp_pose, normal_info
     
     def save_results(self, color_image, depth_image, mask, points, colors):
         """
@@ -934,19 +1163,11 @@ class RealtimeSegmentation3D:
                 # don't forget to transform the units, the point cloud is in meter, but robot
                 # control would like to be in mm. 
 
-                # 计算点云质心（在夹爪坐标系中）
+                # 计算点云质心和法向量（在夹爪坐标系中）
                 if points_gripper is not None and len(points_gripper) > 0:
                     # 抓取点计算计时
                     grasp_calc_start = time.time()
                     
-                    # 计算点云质心
-                    centroid = np.mean(points_gripper, axis=0)
-                    print(f"夹爪坐标系点云质心: {centroid}")
-                    
-                    # 硬编码高度为0.05m
-                    hardcoded_height = 0.025  # 5cm
-                    print(f"使用硬编码高度: {hardcoded_height:.3f}m")
-
                     # 获取当前机器人TCP位置
                     tcp_result = self.robot.get_tcp_position()
                     if isinstance(tcp_result, tuple) and len(tcp_result) == 2:
@@ -957,27 +1178,52 @@ class RealtimeSegmentation3D:
                         tcp_ok = True
                     print(f"当前TCP位置: {current_tcp}")
                     
-                    #import pdb; pdb.set_trace()
-                    # 夹爪坐标系中的目标中心点（转换为毫米）
-                    center_gripper_mm = centroid * 1000
-                    #import pdb; pdb.set_trace()
-                    # 计算相对移动：从当前TCP位置移动到夹爪坐标系中的目标位置
-                    # 注意：夹爪坐标系中的正z方向可能需要根据实际情况调整
-                    # 将工具系(夹爪)位移转换为基座系位移，以避免x/y方向误差
-                    # 工具系位移：让TCP从当前到达对象中心（忽略姿态变化）
-                    delta_tool_mm = [center_gripper_mm[0] , center_gripper_mm[1], hardcoded_height* 1000]
-                    # current_tcp: [x(mm), y(mm), z(mm), rx(rad), ry(rad), rz(rad)]
-                    delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
-                    # 调整Z：使用当前z与期望高度差（正值向上/向下依机器人定义，可按实际调试）
-                    z_offset = -(current_tcp[2] - hardcoded_height * 1000) + 200 - 20
-                    relative_move = [delta_base_xyz[0] +0,delta_base_xyz[1] +0, z_offset, 0, 0, 0]
+                    # 计算考虑法向量的抓取姿态
+                    grasp_pose, normal_info = self.calculate_grasp_pose_with_normal(points_gripper, current_tcp)
+                    
+                    if normal_info is not None:
+                        print("🎯 法向量对齐抓取:")
+                        print(f"  质心: {normal_info['centroid']}")
+                        print(f"  法向量: {normal_info['normal']}")
+                        print(f"  RPY变化: {np.degrees(normal_info['rpy_change'])} 度")
+                        
+                        # 计算相对移动（包含姿态调整）
+                        # 在夹爪坐标系中，位置变化就是目标位置（因为当前TCP在原点）
+                        position_change = grasp_pose[:3]  # 目标物体在夹爪坐标系中的位置
+                        
+                        # 姿态变化：从当前RPY到目标RPY
+                        orientation_change = grasp_pose[3:6] - current_tcp[3:6]
+                        
+                        # 组合相对移动
+                        relative_move = np.concatenate([position_change, orientation_change])
+                        
+                        print(f"位置变化: {position_change} mm")
+                        print(f"姿态变化: {np.degrees(orientation_change)} 度")
+                        
+                    else:
+                        # 回退到简单质心抓取
+                        print("⚠️  法向量计算失败，使用简单质心抓取")
+                        centroid = np.mean(points_gripper, axis=0)
+                        print(f"夹爪坐标系点云质心: {centroid}")
+                        
+                        # 硬编码高度为0.025m
+                        hardcoded_height = 0.025  # 2.5cm
+                        print(f"使用硬编码高度: {hardcoded_height:.3f}m")
+                        
+                        # 夹爪坐标系中的目标中心点（转换为毫米）
+                        center_gripper_mm = centroid * 1000
+                        
+                        # 计算相对移动：从当前TCP位置移动到夹爪坐标系中的目标位置
+                        delta_tool_mm = [center_gripper_mm[0], center_gripper_mm[1], hardcoded_height * 1000]
+                        delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
+                        z_offset = -(current_tcp[2] - hardcoded_height * 1000) + 200 - 20
+                        relative_move = [delta_base_xyz[0], delta_base_xyz[1], z_offset, 0, 0, 0]
                     
                     grasp_calc_time = time.time() - grasp_calc_start
                     self.timers['grasp_calculation'].append(grasp_calc_time)
                     print(f"⏱️  grasp_calculation: {grasp_calc_time:.3f}s")
                     
                     print("Step1 : 准备抓取")
-                    print("夹爪坐标系目标中心:", center_gripper_mm)
                     print("相对移动量:", relative_move)
                     
                     # 机器人移动计时
