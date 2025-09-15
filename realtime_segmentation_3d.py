@@ -1231,9 +1231,9 @@ class RealtimeSegmentation3D:
                     
                     # 执行相对移动
                     #import pdb; pdb.set_trace()
-                    self.robot.set_digital_output(0, 0, 1)
+                    #self.robot.set_digital_output(0, 0, 1)
 
-                    ret = self.robot.linear_move(relative_move, 1, True, 500)
+                    ret = self.robot.linear_move(relative_move, 1, True, 50)
                     # if ret != 0:
                     #     print(f"机器人移动失败: {ret}")
                     #     self.robot.linear_move(original_tcp, 0 , True, 400)
@@ -1251,21 +1251,16 @@ class RealtimeSegmentation3D:
 
                     # 旋转基座90度 (Yaw轴旋转)
                     # 90度 = π/2 弧度 ≈ 1.57 弧度
-                    rotation_angle = math.pi / 2  # 90度
-                    ret = self.robot.joint_move([-np.pi  * 0.6, 0, 0, 0, 0, 0], 1, True, 1)
-                    # if ret != 0:
-                    #     print(f"机器人旋转失败: {ret}")
-                    #     self.robot.linear_move(original_tcp, 0 , True, 400)
-                    #     self.robot.set_digital_output(0, 0, 0)
-                    #     continue
+                    # rotation_angle = math.pi / 2  # 90度
+                    # ret = self.robot.joint_move([-np.pi  * 0.6, 0, 0, 0, 0, 0], 1, True, 1)
 
-                    self.robot.set_digital_output(0, 0, 0)
-                    time.sleep(0.4)
-                    ret = self.robot.joint_move([np.pi  * 0.6, 0, 0, 0, 0, 0], 1, True, 2)
+                    # self.robot.set_digital_output(0, 0, 0)
+                    # time.sleep(0.4)
+                    # ret = self.robot.joint_move([np.pi  * 0.6, 0, 0, 0, 0, 0], 1, True, 2)
                 
-                    #time.sleep(0.01)
-                    #robot move back to the original position
-                    self.robot.linear_move(original_tcp, 0 , True, 500)
+                    # #time.sleep(0.01)
+                    # #robot move back to the original position
+                    # self.robot.linear_move(original_tcp, 0 , True, 500)
                    
                     robot_movement_time = time.time() - robot_movement_start
                     self.timers['robot_movement'].append(robot_movement_time)
