@@ -1,0 +1,15 @@
+{
+  "data_dir": "./process_data",
+  "annotations_file": "process_data/train_annotations.json",
+  "epochs": 100,
+  "batch_size": 128,
+  "lr": 0.001,
+  "backbone": "efficientnet",
+  "train_samples": 1823,
+  "val_samples": 456,
+  "test_samples": 570,
+  "landmark_names": [
+    "body_center"
+  ],
+  "training_date": "2025-09-16T14:18:34.372060"
+}
