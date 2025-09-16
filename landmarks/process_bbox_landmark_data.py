@@ -158,6 +158,85 @@ class BboxLandmarkProcessor:
         
         return landmarks
     
+    def filter_landmarks_for_bbox(self, landmarks: List[Tuple[str, List[float]]], 
+                                 bbox: List[float]) -> List[Tuple[str, List[float]]]:
+        """
+        为特定bbox过滤关键点，选择最相关的头部和身体关键点
+        
+        策略：
+        1. 优先选择在bbox内部的关键点
+        2. 如果没有内部关键点，选择距离bbox中心最近的
+        3. 每个类型（头部/身体）最多选择一个关键点
+        
+        Args:
+            landmarks: 所有关键点列表
+            bbox: [x1, y1, x2, y2]
+            
+        Returns:
+            过滤后的关键点列表，每个类型最多一个
+        """
+        x1, y1, x2, y2 = bbox
+        bbox_center_x = (x1 + x2) / 2
+        bbox_center_y = (y1 + y2) / 2
+        
+        # 按类型分组关键点
+        head_landmarks = []
+        body_landmarks = []
+        
+        for name, coord in landmarks:
+            if name == 'head_center':
+                head_landmarks.append(coord)
+            elif name == 'body_center':
+                body_landmarks.append(coord)
+        
+        filtered_landmarks = []
+        
+        # 选择最佳头部关键点
+        if head_landmarks:
+            best_head = self._select_best_landmark(head_landmarks, bbox, bbox_center_x, bbox_center_y)
+            filtered_landmarks.append(('head_center', best_head))
+        
+        # 选择最佳身体关键点
+        if body_landmarks:
+            best_body = self._select_best_landmark(body_landmarks, bbox, bbox_center_x, bbox_center_y)
+            filtered_landmarks.append(('body_center', best_body))
+        
+        return filtered_landmarks
+    
+    def _select_best_landmark(self, landmarks: List[List[float]], bbox: List[float], 
+                            bbox_center_x: float, bbox_center_y: float) -> List[float]:
+        """
+        从关键点列表中选择最佳的一个
+        
+        Args:
+            landmarks: 关键点坐标列表
+            bbox: [x1, y1, x2, y2]
+            bbox_center_x: bbox中心x坐标
+            bbox_center_y: bbox中心y坐标
+            
+        Returns:
+            最佳关键点坐标
+        """
+        x1, y1, x2, y2 = bbox
+        
+        # 首先尝试找到在bbox内部的关键点
+        inside_landmarks = []
+        for coord in landmarks:
+            x, y = coord
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                inside_landmarks.append(coord)
+        
+        # 如果有内部关键点，选择距离中心最近的
+        if inside_landmarks:
+            return min(inside_landmarks, 
+                      key=lambda coord: ((coord[0] - bbox_center_x) ** 2 + 
+                                       (coord[1] - bbox_center_y) ** 2) ** 0.5)
+        
+        # 如果没有内部关键点，选择距离中心最近的
+        return min(landmarks, 
+                  key=lambda coord: ((coord[0] - bbox_center_x) ** 2 + 
+                                   (coord[1] - bbox_center_y) ** 2) ** 0.5)
+    
     def extract_bbox_from_annotation(self, annotation: Dict) -> Optional[List[float]]:
         """
         从标注中提取bbox
@@ -406,9 +485,16 @@ class BboxLandmarkProcessor:
         
         # 处理每个bbox
         for i, bbox in enumerate(all_bboxes):
+            # 为当前bbox过滤关键点，选择最相关的头部和身体关键点
+            filtered_landmarks = self.filter_landmarks_for_bbox(landmarks, bbox)
+            
+            if len(filtered_landmarks) < 2:
+                print(f"⚠️  bbox {i+1} 过滤后关键点不足: {len(filtered_landmarks)}")
+                continue
+            
             # 裁剪图像并调整关键点
             cropped_image, adjusted_landmarks = self.crop_image_and_adjust_landmarks(
-                image, bbox, landmarks
+                image, bbox, filtered_landmarks
             )
             
             # 检查关键点是否在裁剪后的图像范围内

@@ -32,6 +32,17 @@ from PIL import Image
 from seg import init_models# process_image_cv2
 from mask_to_3d import mask_to_3d_pointcloud, save_pointcloud, load_camera_intrinsics
 from realsense_capture import setup_realsense, depth_to_pointcloud, save_pointcloud_to_file
+# Landmark detector for AI-based grasp point estimation
+try:
+    # 优先以包形式导入
+    from landmarks.fish_landmark_detector import FishLandmarkDetector
+except Exception:
+    # 兼容直接在工作区根目录运行
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'landmarks'))
+    try:
+        from fish_landmark_detector import FishLandmarkDetector
+    except Exception:
+        FishLandmarkDetector = None
 
 # 追加自定义模块搜索路径（手眼标定目录）
 _extra_paths = [
@@ -45,7 +56,8 @@ for _p in _extra_paths:
         pass
 
 class RealtimeSegmentation3D:
-    def __init__(self, output_dir, device="cpu", save_pointcloud=True, intrinsics_file=None, hand_eye_file=None, bbox_selection="highest_confidence", debug=False, use_yolo=False, yolo_weights=None):
+    def __init__(self, output_dir, device="cpu", save_pointcloud=True, intrinsics_file=None, hand_eye_file=None, bbox_selection="highest_confidence", debug=False, use_yolo=False, yolo_weights=None,
+                 grasp_point_mode: str = "centroid", landmark_model_path: str = None):
         """
         初始化实时分割和3D点云生成器
         
@@ -67,6 +79,9 @@ class RealtimeSegmentation3D:
         self.debug = debug
         self.use_yolo = use_yolo
         self.yolo_weights = yolo_weights
+        # 抓取点模式：centroid 或 ai
+        self.grasp_point_mode = grasp_point_mode
+        self.landmark_model_path = landmark_model_path
         # 创建输出目录（仅在debug模式下创建）
         if self.debug:
             self.rgb_dir = os.path.join(output_dir, "rgb")
@@ -161,6 +176,24 @@ class RealtimeSegmentation3D:
             print(self.hand_eye_transform)
         
         print("初始化完成！")
+
+        # 初始化AI关键点检测器（可选）
+        self.landmark_detector = None
+        if self.grasp_point_mode == "ai":
+            if FishLandmarkDetector is None:
+                print("[警告] 无法导入 FishLandmarkDetector，将回退为质心模式")
+                self.grasp_point_mode = "centroid"
+            else:
+                try:
+                    if landmark_model_path is None:
+                        print("[警告] 未提供 landmark_model_path，将回退为质心模式")
+                        self.grasp_point_mode = "centroid"
+                    else:
+                        self.landmark_detector = FishLandmarkDetector(model_path=landmark_model_path, device=('cuda' if self.device=='cuda' and torch.cuda.is_available() else 'cpu'))
+                        print(f"已加载AI关键点模型: {landmark_model_path}")
+                except Exception as e:
+                    print(f"[警告] 关键点模型初始化失败: {e}，将回退为质心模式")
+                    self.grasp_point_mode = "centroid"
 
 
         import jkrc 
@@ -1323,41 +1356,50 @@ class RealtimeSegmentation3D:
                         tcp_ok = True
                     print(f"当前TCP位置: {current_tcp}")
                     
-                    # 计算考虑法向量的抓取姿态
-                    grasp_pose, normal_info = self.calculate_grasp_pose_with_normal(points_gripper, current_tcp)
-                    #normal_info = None 
-                
-                    print("🎯 法向量对齐抓取:")
-                    print(f"  质心: {normal_info['centroid']}")
-                    print(f"  法向量: {normal_info['normal']}")
-                    print(f"  RPY变化: {np.degrees(normal_info['rpy_change'])} 度")
-                    
-                    # 计算相对移动（包含姿态调整）
-                    # 在夹爪坐标系中，位置变化就是目标位置（因为当前TCP在原点）
-                    position_change = grasp_pose[:3]  # 目标物体在夹爪坐标系中的位置
+                    # 计算抓取点（优先AI）
+                    relative_move = None
+                    if self.grasp_point_mode == "ai" and self.landmark_detector is not None and mask_vis is not None:
+                        try:
+                            # 根据掩码计算外接矩形，得到鱼的裁剪区域
+                            ys, xs = np.where(mask_vis > 0)
+                            if ys.size > 0 and xs.size > 0:
+                                x1, y1 = int(xs.min()), int(ys.min())
+                                x2, y2 = int(xs.max())+1, int(ys.max())+1
+                                crop_bgr = color_image[y1:y2, x1:x2]
+                                crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+                                # 预测局部坐标系下的中心点
+                                pred_landmarks, pred_visibility = self.landmark_detector.predict(crop_rgb)
+                                center_xy = self.landmark_detector.calculate_fish_center(pred_landmarks, pred_visibility)
+                                # 映射回全图坐标
+                                u = float(x1 + center_xy[0])
+                                v = float(y1 + center_xy[1])
+                                # 深度（米）
+                                z_m = float(depth_image[int(round(v)), int(round(u))]) / 1000.0
+                                if z_m <= 0:
+                                    raise ValueError("无效深度")
+                                # 反投影到相机坐标系
+                                X = (u - self.cx) / self.fx * z_m
+                                Y = (v - self.cy) / self.fy * z_m
+                                point_cam = np.array([[X, Y, z_m]], dtype=np.float32)
+                                # 相机→夹爪
+                                point_grip = self.apply_hand_eye_transform(point_cam)[0]
+                                center_gripper_mm = point_grip * 1000.0
+                                delta_tool_mm = [center_gripper_mm[0], center_gripper_mm[1], center_gripper_mm[2]]
+                                delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
+                                z_offset = -delta_tool_mm[2] -25
+                                relative_move = [delta_base_xyz[0], delta_base_xyz[1], z_offset, 0, 0, 0]
+                                print(f"🎯 使用AI身体中心: uv=({u:.1f},{v:.1f}) -> grip(mm)={center_gripper_mm}")
+                            else:
+                                print("[AI] 掩码为空，回退质心")
+                        except Exception as e:
+                            print(f"[AI] 预测身体中心失败，回退质心: {e}")
 
-                    # 姿态变化：从当前RPY到目标RPY
-                    orientation_change = grasp_pose[3:6] - current_tcp[3:6]
-                    orientation_change[0] = 0
-                    orientation_change[1] = 0
-                    orientation_change[2] = 0
-
-                    # 组合相对移动
-                    relative_move = np.concatenate([orientation_change * position_change, orientation_change])
-                    
-                    print(f"位置变化: {position_change} mm")
-                    print(f"姿态变化: {np.degrees(orientation_change)} 度")
-                    
-                    if True:
-                        # 回退到简单质心抓取
-                        print("⚠️  法向量计算失败，使用简单质心抓取")
+                    # 若AI未生成移动，使用质心点云方案
+                    if relative_move is None:
+                        # 质心点（夹爪系）
                         centroid = np.mean(points_gripper, axis=0)
                         print(f"夹爪坐标系点云质心: {centroid}")
-                        
-                        # 夹爪坐标系中的目标中心点（转换为毫米）
                         center_gripper_mm = centroid * 1000
-                        
-                        # 计算相对移动：从当前TCP位置移动到夹爪坐标系中的目标位置
                         delta_tool_mm = [center_gripper_mm[0], center_gripper_mm[1], center_gripper_mm[2]]
                         delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
                         z_offset = -delta_tool_mm[2] -25
@@ -1468,6 +1510,11 @@ def main():
                       help='使用YOLO作为检测器（替代Grounding DINO）')
     parser.add_argument('--yolo_weights', type=str, default=None,
                       help='YOLO权重文件(.pt)路径（与 --use_yolo 搭配使用）')
+    parser.add_argument('--grasp_point_mode', type=str, default='centroid',
+                      choices=['centroid', 'ai'],
+                      help='抓取点模式: centroid(点云质心) 或 ai(使用AI身体中心)')
+    parser.add_argument('--landmark_model_path', type=str, default=None,
+                      help='AI身体中心模型路径 (.pth)，当 grasp_point_mode=ai 时必需')
     
     args = parser.parse_args()
     
@@ -1482,7 +1529,9 @@ def main():
             bbox_selection=args.bbox_selection,
             debug=args.debug,
             use_yolo=args.use_yolo,
-            yolo_weights=args.yolo_weights
+            yolo_weights=args.yolo_weights,
+            grasp_point_mode=args.grasp_point_mode,
+            landmark_model_path=args.landmark_model_path
         )
         
         # 运行实时处理
