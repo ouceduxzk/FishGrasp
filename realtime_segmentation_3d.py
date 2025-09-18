@@ -1200,23 +1200,23 @@ class RealtimeSegmentation3D:
         
         print(f"已保存第 {self.frame_count} 帧结果")
     
-    def show_preview(self, color_image, depth_image, mask):
+    def show_preview(self, color_image, depth_image, mask, detection_vis=None, landmark_vis=None):
         """
-        在一个窗口中显示RGB、深度图和分割结果
+        在一个窗口中显示2x2网格：RGB、检测、分割和关键点预测结果
         """
-        # 创建深度可视化
-        valid_depth = depth_image > 0
-        if valid_depth.any():
-            depth_min = depth_image[valid_depth].min()
-            depth_max = depth_image[valid_depth].max()
-            depth_normalized = np.zeros_like(depth_image, dtype=np.uint8)
-            if depth_max > depth_min:
-                depth_normalized[valid_depth] = ((depth_image[valid_depth] - depth_min) / (depth_max - depth_min) * 255).astype(np.uint8)
-            depth_colormap = cv2.applyColorMap(depth_normalized, cv2.COLORMAP_JET)
-        else:
-            depth_colormap = np.zeros((depth_image.shape[0], depth_image.shape[1], 3), dtype=np.uint8)
+        # 调整图像大小
+        display_size = (600, 450)
         
-        # 创建分割可视化
+        # 1. RGB图像
+        rgb_display = cv2.resize(color_image, display_size)
+        
+        # 2. 检测可视化（如果没有提供，使用RGB图像）
+        if detection_vis is not None:
+            detection_display = cv2.resize(detection_vis, display_size)
+        else:
+            detection_display = rgb_display.copy()
+        
+        # 3. 分割可视化
         if mask is not None:
             # 将掩码转换为彩色图像
             mask_colored = np.zeros_like(color_image)
@@ -1225,23 +1225,41 @@ class RealtimeSegmentation3D:
             segmentation_vis = cv2.addWeighted(color_image, 0.7, mask_colored, 0.3, 0)
         else:
             segmentation_vis = color_image.copy()
-        
-        # 调整图像大小
-        display_size = (400, 300)
-        color_display = cv2.resize(color_image, display_size)
-        depth_display = cv2.resize(depth_colormap, display_size)
         seg_display = cv2.resize(segmentation_vis, display_size)
         
-        # 水平拼接三个图像
-        combined = np.hstack((color_display, depth_display, seg_display))
+        # 4. 关键点预测可视化（如果没有提供，使用RGB图像）
+        if landmark_vis is not None:
+            landmark_display = cv2.resize(landmark_vis, display_size)
+        else:
+            landmark_display = rgb_display.copy()
+        
+        # 创建2x2网格
+        # 第一行：RGB | 检测
+        top_row = np.hstack((rgb_display, detection_display))
+        # 第二行：分割 | 关键点
+        bottom_row = np.hstack((seg_display, landmark_display))
+        # 垂直拼接
+        combined = np.vstack((top_row, bottom_row))
         
         # 添加标签
-        cv2.putText(combined, "RGB", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.putText(combined, "Depth", (410, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.putText(combined, "Segmentation", (810, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-        cv2.putText(combined, f"Frame: {self.frame_count}", (10, combined.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.8
+        font_thickness = 2
+        text_color = (0, 255, 0)
         
-        cv2.imshow('RGB | Depth | Segmentation', combined)
+        # 第一行标签
+        cv2.putText(combined, "RGB", (15, 45), font, font_scale, text_color, font_thickness)
+        cv2.putText(combined, "Detection", (615, 45), font, font_scale, text_color, font_thickness)
+        
+        # 第二行标签
+        cv2.putText(combined, "Segmentation", (15, 495), font, font_scale, text_color, font_thickness)
+        cv2.putText(combined, "Landmarks", (615, 495), font, font_scale, text_color, font_thickness)
+        
+        # 添加帧计数
+        cv2.putText(combined, f"Frame: {self.frame_count}", (10, combined.shape[0] - 10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        cv2.imshow('Real-time Processing (2x2 Grid)', combined)
 
     
     def run_realtime(self, max_frames=None, show_preview=True):
@@ -1302,8 +1320,60 @@ class RealtimeSegmentation3D:
                         depth_vis_path = os.path.join(self.depth_dir, f"{base_name}_visualization.png")
                         cv2.imwrite(depth_vis_path, depth_colormap)
 
+                # 生成检测可视化
+                detection_vis = None
+                if mask_vis is not None:
+                    # 重新运行检测以获取边界框可视化
+                    if getattr(self, 'use_yolo', False):
+                        boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.25, iou=0.45, imgsz=640)
+                    else:
+                        boxes = self._detect_boxes(color_image)
+                    
+                    if boxes:
+                        detection_vis = color_image.copy()
+                        # 绘制所有检测框
+                        for i, box in enumerate(boxes):
+                            if len(box) >= 4:
+                                x1, y1, x2, y2 = box[:4]
+                                color = (0, 255, 0) if i == 0 else (0, 255, 255)  # 第一个框用绿色，其他用黄色
+                                thickness = 3 if i == 0 else 2
+                                cv2.rectangle(detection_vis, (x1, y1), (x2, y2), color, thickness)
+                                if len(box) >= 5:
+                                    confidence = box[4]
+                                    cv2.putText(detection_vis, f"{confidence:.2f}", (x1, y1-10), 
+                                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                
+                # 生成关键点预测可视化
+                landmark_vis = None
+                if (self.grasp_point_mode == "ai" and self.landmark_detector is not None and 
+                    mask_vis is not None):
+                    try:
+                        # 根据掩码计算外接矩形，得到鱼的裁剪区域
+                        ys, xs = np.where(mask_vis > 0)
+                        if ys.size > 0 and xs.size > 0:
+                            x1, y1 = int(xs.min()), int(ys.min())
+                            x2, y2 = int(xs.max())+1, int(ys.max())+1
+                            crop_bgr = color_image[y1:y2, x1:x2]
+                            crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+                            
+                            # 预测关键点
+                            pred_landmarks, pred_visibility = self.landmark_detector.predict(crop_rgb)
+                            
+                            # 可视化关键点
+                            landmark_vis_crop = self.landmark_detector.visualize_landmarks(crop_rgb, pred_landmarks, pred_visibility)
+                            
+                            # 将裁剪区域的可视化结果放回原图
+                            landmark_vis = color_image.copy()
+                            landmark_vis_bgr = cv2.cvtColor(landmark_vis_crop, cv2.COLOR_RGB2BGR)
+                            landmark_vis[y1:y2, x1:x2] = landmark_vis_bgr
+                            
+                            # 绘制边界框
+                            cv2.rectangle(landmark_vis, (x1, y1), (x2, y2), (255, 0, 0), 2)
+                    except Exception as e:
+                        print(f"[可视化] 关键点预测可视化失败: {e}")
+                
                 # 显示预览窗口
-                self.show_preview(color_image, depth_image, mask_vis)
+                self.show_preview(color_image, depth_image, mask_vis, detection_vis, landmark_vis)
                 
                 # 确保窗口显示并处理按键
                 key = cv2.waitKey(1) & 0xFF
