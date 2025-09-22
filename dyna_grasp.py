@@ -14,10 +14,6 @@
     - 现有的seg.py, mask_to_3d.py, realsense_capture.py
     - pyrealsense2, opencv-python, numpy, torch
     - segment_anything, transformers, open3d
-
-
-
-    add a training mechasim that grasp only on the fish with masked out other region 
 """
 
 import argparse
@@ -61,7 +57,7 @@ for _p in _extra_paths:
 
 class RealtimeSegmentation3D:
     def __init__(self, output_dir, device="cpu", save_pointcloud=True, intrinsics_file=None, hand_eye_file=None, bbox_selection="highest_confidence", debug=False, use_yolo=False, yolo_weights=None,
-                 grasp_point_mode: str = "centroid", landmark_model_path: str = None):
+                 grasp_point_mode: str = "centroid", landmark_model_path: str = None, target_speed: float = 0.192):
         """
         初始化实时分割和3D点云生成器
         
@@ -75,6 +71,9 @@ class RealtimeSegmentation3D:
             debug: 是否启用调试模式（保存所有中间文件）
             use_yolo: 是否使用YOLO作为检测器
             yolo_weights: YOLO权重路径（.pt）
+            grasp_point_mode: 抓取点模式 ("centroid" 或 "ai")
+            landmark_model_path: AI关键点模型路径
+            target_speed: 目标移动速度 (m/s)，用于动态抓取Y+方向补偿 (默认: 0.192)
         """
         self.output_dir = output_dir
         self.device = device
@@ -86,6 +85,9 @@ class RealtimeSegmentation3D:
         # 抓取点模式：centroid 或 ai
         self.grasp_point_mode = grasp_point_mode
         self.landmark_model_path = landmark_model_path
+        
+        # 动态抓取参数
+        self.target_speed = target_speed  # m/s
         # 创建输出目录（仅在debug模式下创建）
         if self.debug:
             self.rgb_dir = os.path.join(output_dir, "rgb")
@@ -418,7 +420,6 @@ class RealtimeSegmentation3D:
             return None, None
 
         print(f"选择最近候选: idx={best_idx}, 深度={best_depth_m:.4f} m")
-
         if best_depth_m > 0.8:
             print(f"深度超过0.8m，跳过")
             return None, None
@@ -1302,9 +1303,7 @@ class RealtimeSegmentation3D:
                 
                 self.frame_count = self.frame_count + 1
                
-                if self.frame_count < 10 :
-                    print(f"跳过前10帧，等待相机稳定...")
-                    continue
+
                 # 检测 + 分割 + 落盘（最近目标选择）
                 mask_vis, base_name = self.detect_and_segment_and_dump_all(color_image, depth_image)
                 
@@ -1335,7 +1334,7 @@ class RealtimeSegmentation3D:
                 if mask_vis is not None:
                     # 重新运行检测以获取边界框可视化
                     if getattr(self, 'use_yolo', False):
-                        boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.25, iou=0.45, imgsz=640)
+                        boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.5, iou=0.45, imgsz=640)
                     else:
                         boxes = self._detect_boxes(color_image)
                     
@@ -1438,7 +1437,6 @@ class RealtimeSegmentation3D:
                     
                     # 计算抓取点（优先AI）
                     relative_move = None
-                    angle_rad = 0
                     if self.grasp_point_mode == "ai" and self.landmark_detector is not None and mask_vis is not None:
                         try:
                             # 根据掩码计算外接矩形，得到鱼的裁剪区域
@@ -1448,80 +1446,28 @@ class RealtimeSegmentation3D:
                                 x2, y2 = int(xs.max())+1, int(ys.max())+1
                                 crop_bgr = color_image[y1:y2, x1:x2]
                                 crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-                                # 预测局部坐标系下的两个关键点（0=body_center, 1=head_center）
+                                # 预测局部坐标系下的中心点
                                 pred_landmarks, pred_visibility = self.landmark_detector.predict(crop_rgb)
-                                if pred_landmarks.shape[0] >= 2:
-                                    body_xy_local = pred_landmarks[0]
-                                    head_xy_local = pred_landmarks[1]
-                                else:
-                                    # 兼容只有一个点的情况
-                                    body_xy_local = pred_landmarks[0]
-                                    head_xy_local = pred_landmarks[0]
-
-                                # 映射回全图坐标（像素）
-                                u_body = float(x1 + body_xy_local[0])
-                                v_body = float(y1 + body_xy_local[1])
-                                u_head = float(x1 + head_xy_local[0])
-                                v_head = float(y1 + head_xy_local[1])
-
+                                center_xy = self.landmark_detector.calculate_fish_center(pred_landmarks, pred_visibility)
+                                # 映射回全图坐标
+                                u = float(x1 + center_xy[0])
+                                v = float(y1 + center_xy[1])
                                 # 深度（米）
-                                z_body_m = float(depth_image[int(round(v_body)), int(round(u_body))]) / 1000.0 if 0 <= int(round(v_body)) < depth_image.shape[0] and 0 <= int(round(u_body)) < depth_image.shape[1] else 0.0
-                                z_head_m = float(depth_image[int(round(v_head)), int(round(u_head))]) / 1000.0 if 0 <= int(round(v_head)) < depth_image.shape[0] and 0 <= int(round(u_head)) < depth_image.shape[1] else 0.0
-                                if z_body_m <= 0:
-                                    print(f"无效身体中心深度: {z_body_m}")
+                                z_m = float(depth_image[int(round(v)), int(round(u))]) / 1000.0
+                                if z_m <= 0:
                                     raise ValueError("无效深度")
-
-                                # 反投影到相机坐标系（身体中心）
-                                Xb = (u_body - self.cx) / self.fx * z_body_m
-                                Yb = (v_body - self.cy) / self.fy * z_body_m
-                                point_cam_body = np.array([[Xb, Yb, z_body_m]], dtype=np.float32)
-
-                                # 反投影到相机坐标系（头部中心，如无效深度则沿用身体深度）
-                                if z_head_m <= 0:
-                                    z_head_m = z_body_m
-                                Xh = (u_head - self.cx) / self.fx * z_head_m
-                                Yh = (v_head - self.cy) / self.fy * z_head_m
-                                point_cam_head = np.array([[Xh, Yh, z_head_m]], dtype=np.float32)
-
+                                # 反投影到相机坐标系
+                                X = (u - self.cx) / self.fx * z_m
+                                Y = (v - self.cy) / self.fy * z_m
+                                point_cam = np.array([[X, Y, z_m]], dtype=np.float32)
                                 # 相机→夹爪
-                                point_grip_body = self.apply_hand_eye_transform(point_cam_body)[0]
-                                point_grip_head = self.apply_hand_eye_transform(point_cam_head)[0]
-                                body_grip_mm = point_grip_body * 1000.0
-                                head_grip_mm = point_grip_head * 1000.0
-
-                                # 方向向量（图像坐标系，单位向量）
-                                dir_img = np.array([u_head - u_body, v_head - v_body], dtype=np.float32)
-                                norm_img = np.linalg.norm(dir_img) + 1e-6
-                                dir_img_unit = (dir_img / norm_img).tolist()
-
-                                # 方向向量（夹爪坐标系XY，单位向量，mm）
-                                dir_grip_xy = np.array([head_grip_mm[0] - body_grip_mm[0], head_grip_mm[1] - body_grip_mm[1]], dtype=np.float32)
-                                norm_grip = np.linalg.norm(dir_grip_xy) + 1e-6
-                                dir_grip_xy_unit = (dir_grip_xy / norm_grip).tolist()
-
-
-            
-                                # 当前抓取按身体中心
-                                delta_tool_mm = [body_grip_mm[0], body_grip_mm[1], body_grip_mm[2]]
+                                point_grip = self.apply_hand_eye_transform(point_cam)[0]
+                                center_gripper_mm = point_grip * 1000.0
+                                delta_tool_mm = [center_gripper_mm[0], center_gripper_mm[1], center_gripper_mm[2]]
                                 delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
-                                z_offset = -delta_tool_mm[2] - 25
-
-                                print(f"🎯 使用AI身体中心: uv=({u_body:.1f},{v_body:.1f}) -> grip(mm)={body_grip_mm}")
-                                print(f"📍 头部中心: uv=({u_head:.1f},{v_head:.1f}) -> grip(mm)={head_grip_mm}")
-                                print(f"🧭 方向(像素xy,单位向量) body→head = {dir_img_unit}")
-                                print(f"🧭 方向(夹爪XY,单位向量) body→head = {dir_grip_xy_unit}")
-                                # 与X轴(1,0,0)的夹角（弧度），并规范化到 [-pi/2, pi/2]
-                                # 这样无论鱼体原始朝向如何，都会被映射到“朝向+X半平面”的等效姿态，便于统一放置方向
-                                angle_rad = float(np.arctan2(dir_grip_xy_unit[1], dir_grip_xy_unit[0]))
-                                if angle_rad > np.pi/2:
-                                    angle_rad -= np.pi
-                                elif angle_rad < -np.pi/2:
-                                    angle_rad += np.pi
-                                
-
+                                z_offset = -delta_tool_mm[2] -25
                                 relative_move = [delta_base_xyz[0], delta_base_xyz[1], z_offset, 0, 0, 0]
-
-                                print(f"🧮 方向与X轴的夹角(rad): {angle_rad:.4f}")
+                                print(f"🎯 使用AI身体中心: uv=({u:.1f},{v:.1f}) -> grip(mm)={center_gripper_mm}")
                             else:
                                 print("[AI] 掩码为空，回退质心")
                         except Exception as e:
@@ -1535,8 +1481,13 @@ class RealtimeSegmentation3D:
                         center_gripper_mm = centroid * 1000
                         delta_tool_mm = [center_gripper_mm[0], center_gripper_mm[1], center_gripper_mm[2]]
                         delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
-                        z_offset = -delta_tool_mm[2] -25
+                        z_offset = -delta_tool_mm[2] + 100
                         relative_move = [delta_base_xyz[0], delta_base_xyz[1], z_offset, 0, 0, 0]
+                    
+                    # 动态抓取补偿：在Y+方向添加1秒的移动补偿
+                    y_compensation = self.target_speed * 1700  # 转换为mm
+                    relative_move[1] += y_compensation
+                    print(f"🎯 动态抓取补偿: Y+方向 {y_compensation:.1f}mm (速度: {self.target_speed:.3f} m/s)")
                     
                     grasp_calc_time = time.time() - grasp_calc_start
                     self.timers['grasp_calculation'].append(grasp_calc_time)
@@ -1553,6 +1504,10 @@ class RealtimeSegmentation3D:
                     self.robot.set_digital_output(0, 0, 1)
 
                     ret = self.robot.linear_move(relative_move, 1, True, 500)
+
+
+                    #self.robot.linear_move([0, 200 , -10, 0, 0, 0], 1, True, 500)
+
                     # if ret != 0:
                     #     print(f"机器人移动失败: {ret}")
                     #     self.robot.linear_move(original_tcp, 0 , True, 400)
@@ -1568,20 +1523,17 @@ class RealtimeSegmentation3D:
                     #     continue
                     self.robot.linear_move(original_tcp, 0 , True, 500)
 
-                    print(f"旋转基座{angle_rad:.4f}弧度")
-                    ret = self.robot.joint_move([-np.pi  * 0.6, 0, 0, 0, 0, angle_rad -  np.pi * 0.6], 1, True, 1)
-                    ret = self.robot.linear_move([0, 0, -350, 0, 0, 0], 1 , True, 500)
+                    # move the robot to the y+ for 3cm with same speed of the 0.192 m/s 
+
+                    ret = self.robot.joint_move([-np.pi  * 0.6, 0, 0, 0, 0, 0], 1, True, 1)
 
                     self.robot.set_digital_output(0, 0, 0)
                     time.sleep(0.4)
-                    ret = self.robot.linear_move([0, 0, 350, 0, 0, 0], 1 , True, 500)
                     ret = self.robot.joint_move([np.pi  * 0.6, 0, 0, 0, 0, 0], 1, True, 2)
-                    ret = self.robot.joint_move([0, 0, 0, 0, 0,  np.pi * 0.6 - angle_rad], 1, True, 2)
                 
-
-                    #time.sleep(0.01)
-                    #robot move back to the original position
-                    self.robot.linear_move(original_tcp, 0 , True, 500)
+                    # #time.sleep(0.01)
+                    # #robot move back to the original position
+                    # self.robot.linear_move(original_tcp, 0 , True, 500)
                    
                     robot_movement_time = time.time() - robot_movement_start
                     self.timers['robot_movement'].append(robot_movement_time)
@@ -1653,6 +1605,8 @@ def main():
                       help='抓取点模式: centroid(点云质心) 或 ai(使用AI身体中心)')
     parser.add_argument('--landmark_model_path', type=str, default=None,
                       help='AI身体中心模型路径 (.pth)，当 grasp_point_mode=ai 时必需')
+    parser.add_argument('--target_speed', type=float, default=0.14,
+                      help='目标移动速度 (m/s)，用于动态抓取Y+方向补偿 (默认: 0.192)')
     
     args = parser.parse_args()
     
@@ -1669,7 +1623,8 @@ def main():
             use_yolo=args.use_yolo,
             yolo_weights=args.yolo_weights,
             grasp_point_mode=args.grasp_point_mode,
-            landmark_model_path=args.landmark_model_path
+            landmark_model_path=args.landmark_model_path,
+            target_speed=args.target_speed
         )
         
         # 运行实时处理
