@@ -1465,7 +1465,7 @@ class RealtimeSegmentation3D:
                                 center_gripper_mm = point_grip * 1000.0
                                 delta_tool_mm = [center_gripper_mm[0], center_gripper_mm[1], center_gripper_mm[2]]
                                 delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
-                                z_offset = -delta_tool_mm[2] -25
+                                z_offset = -delta_tool_mm[2] -20
                                 relative_move = [delta_base_xyz[0], delta_base_xyz[1], z_offset, 0, 0, 0]
                                 print(f"🎯 使用AI身体中心: uv=({u:.1f},{v:.1f}) -> grip(mm)={center_gripper_mm}")
                             else:
@@ -1485,7 +1485,7 @@ class RealtimeSegmentation3D:
                         relative_move = [delta_base_xyz[0], delta_base_xyz[1], z_offset, 0, 0, 0]
                     
                     # 动态抓取补偿：在Y+方向添加1秒的移动补偿
-                    y_compensation = self.target_speed * 1700  # 转换为mm
+                    y_compensation = self.target_speed * 1000  # 转换为mm
                     relative_move[1] += y_compensation
                     print(f"🎯 动态抓取补偿: Y+方向 {y_compensation:.1f}mm (速度: {self.target_speed:.3f} m/s)")
                     
