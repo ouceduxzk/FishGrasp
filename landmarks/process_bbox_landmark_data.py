@@ -7,7 +7,7 @@
 
 使用示例:
     # 基本用法
-    python3 process_bbox_landmark_data.py --data_dir ../final_data/landmarks_9.11 --output_dir ./output --create_annotations
+    python3 process_bbox_landmark_data.py --data_dir ../final_data/landmarks_9.18 --output_dir ./process_data --create_annotations
     
     # 查看帮助和使用示例
     python process_bbox_landmark_data.py --help
@@ -576,8 +576,15 @@ class BboxLandmarkProcessor:
         """
         print(f"\n🔄 处理 {split} 数据集...")
         
+        # 检查是否存在 train/val 子目录结构
         images_dir = self.data_dir / "images" / split
         labels_dir = self.data_dir / "labels" / split
+        
+        # 如果不存在子目录，使用直接的 images/ 和 labels/ 目录
+        if not images_dir.exists():
+            images_dir = self.data_dir / "images"
+            labels_dir = self.data_dir / "labels"
+            print(f"📂 使用统一目录结构: {images_dir}, {labels_dir}")
         
         if not images_dir.exists():
             print(f"❌ 图像目录不存在: {images_dir}")
@@ -628,13 +635,24 @@ class BboxLandmarkProcessor:
         
         all_data = {}
         
-        # 处理训练集
-        train_data = self.process_dataset_split('train')
-        all_data['train'] = train_data
+        # 检查是否存在 train/val 子目录结构
+        train_images_dir = self.data_dir / "images" / "train"
+        val_images_dir = self.data_dir / "images" / "val"
         
-        # 处理验证集
-        val_data = self.process_dataset_split('val')
-        all_data['val'] = val_data
+        if train_images_dir.exists() and val_images_dir.exists():
+            # 标准格式：处理训练集和验证集
+            print("📂 检测到标准目录结构 (train/val)")
+            train_data = self.process_dataset_split('train')
+            all_data['train'] = train_data
+            
+            val_data = self.process_dataset_split('val')
+            all_data['val'] = val_data
+        else:
+            # 简化格式：处理所有数据作为训练集
+            print("📂 检测到简化目录结构，将所有数据作为训练集")
+            train_data = self.process_dataset_split('train')  # 这会使用统一的 images/ 和 labels/ 目录
+            all_data['train'] = train_data
+            all_data['val'] = []  # 验证集为空
         
         # 保存处理结果摘要
         self.save_processing_summary(all_data)
@@ -732,12 +750,26 @@ def main():
         print(f"❌ 数据目录不存在: {data_dir}")
         return
     
-    # 检查目录结构
-    required_dirs = ['images/train', 'images/val', 'labels/train', 'labels/val']
-    for req_dir in required_dirs:
-        if not (data_dir / req_dir).exists():
-            print(f"❌ 缺少必要目录: {data_dir / req_dir}")
-            return
+    # 检查目录结构 - 支持两种格式
+    # 格式1: images/train, images/val, labels/train, labels/val (标准格式)
+    # 格式2: images/, labels/ (简化格式)
+    required_dirs_standard = ['images/train', 'images/val', 'labels/train', 'labels/val']
+    required_dirs_simple = ['images', 'labels']
+    
+    # 检查标准格式
+    standard_format = all((data_dir / req_dir).exists() for req_dir in required_dirs_standard)
+    # 检查简化格式
+    simple_format = all((data_dir / req_dir).exists() for req_dir in required_dirs_simple)
+    
+    if not standard_format and not simple_format:
+        print(f"❌ 目录结构不正确!")
+        print(f"   支持的格式:")
+        print(f"   格式1 (标准): {[str(data_dir / d) for d in required_dirs_standard]}")
+        print(f"   格式2 (简化): {[str(data_dir / d) for d in required_dirs_simple]}")
+        return
+    
+    if simple_format and not standard_format:
+        print(f"📂 检测到简化目录结构，将处理所有数据")
     
     # 创建处理器
     processor = BboxLandmarkProcessor(args.data_dir, args.output_dir)

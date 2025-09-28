@@ -45,7 +45,9 @@ from data_loader import FishLandmarkDataLoader
 
 def train_model(data_dir: str, annotations_file: str, epochs: int = 100, 
                 batch_size: int = 16, lr: float = 0.001, backbone: str = 'resnet18',
-                save_dir: str = 'models', test_split: float = 0.2, val_split: float = 0.2):
+                save_dir: str = 'models', test_split: float = 0.2, val_split: float = 0.2,
+                same_folder_mode: bool = False, sharpness: float = 1.0, 
+                loss_type: str = 'ellipsoid'):
     """训练鱼体关键点检测模型"""
     
     print("="*60)
@@ -57,7 +59,9 @@ def train_model(data_dir: str, annotations_file: str, epochs: int = 100,
     
     # 加载数据
     print("📁 加载数据...")
-    loader = FishLandmarkDataLoader(data_dir)
+    if same_folder_mode:
+        print("📂 使用同文件夹模式：图像和JSON文件在同一目录")
+    loader = FishLandmarkDataLoader(data_dir, same_folder_mode=same_folder_mode)
     
     # 根据文件扩展名确定格式
     if annotations_file.endswith('.json'):
@@ -109,14 +113,14 @@ def train_model(data_dir: str, annotations_file: str, epochs: int = 100,
     train_transform, val_transform = create_data_transforms()
     
     # 创建数据集
-    train_dataset = FishLandmarkDataset(train_paths, train_landmarks, train_transform)
+    train_dataset = FishLandmarkDataset(train_paths, train_landmarks, train_transform)  # 使用所有关键点
     
     # 创建数据加载器
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
     
     # 处理验证集
     if len(val_paths) > 0:
-        val_dataset = FishLandmarkDataset(val_paths, val_landmarks, val_transform)
+        val_dataset = FishLandmarkDataset(val_paths, val_landmarks, val_transform)  # 使用所有关键点
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
     else:
         print("⚠️  验证集为空，将使用训练集的一部分作为验证集")
@@ -129,8 +133,8 @@ def train_model(data_dir: str, annotations_file: str, epochs: int = 100,
             train_landmarks = train_landmarks[val_size:]
             
             # 重新创建数据集
-            train_dataset = FishLandmarkDataset(train_paths, train_landmarks, train_transform)
-            val_dataset = FishLandmarkDataset(val_paths, val_landmarks, val_transform)
+            train_dataset = FishLandmarkDataset(train_paths, train_landmarks, train_transform)  # 使用所有关键点
+            val_dataset = FishLandmarkDataset(val_paths, val_landmarks, val_transform)  # 使用所有关键点
             
             train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
             val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
@@ -151,21 +155,28 @@ def train_model(data_dir: str, annotations_file: str, epochs: int = 100,
     
     # 训练模型
     print("🚀 开始训练...")
+    print(f"🔧 损失函数类型: {loss_type}")
+    print(f"🔧 锐度参数: {sharpness} (值越大越锐利，惩罚越重)")
+    print(f"🎯 预测关键点: {detector.landmark_names} (仅身体中心)")
     if val_loader is not None:
-        train_losses, val_losses = detector.train_with_gaussian_loss(
+        train_losses, val_losses = detector.train_with_configurable_loss(
             train_loader=train_loader,
             val_loader=val_loader,
             epochs=epochs,
             lr=lr,
-            save_dir=save_dir
+            save_dir=save_dir,
+            sharpness=sharpness,
+            loss_type=loss_type
         )
     else:
         print("⚠️  没有验证集，将只进行训练（不进行验证）")
-        train_losses, val_losses = detector.train_without_validation_gaussian(
+        train_losses, val_losses = detector.train_without_validation_configurable_loss(
             train_loader=train_loader,
             epochs=epochs,
             lr=lr,
-            save_dir=save_dir
+            save_dir=save_dir,
+            sharpness=sharpness,
+            loss_type=loss_type
         )
     
     # 保存训练配置
@@ -180,6 +191,8 @@ def train_model(data_dir: str, annotations_file: str, epochs: int = 100,
         'val_samples': len(val_paths),
         'test_samples': len(test_paths),
         'landmark_names': detector.landmark_names,
+        'loss_type': loss_type,
+        'sharpness': sharpness,
         'training_date': datetime.now().isoformat()
     }
     
@@ -195,7 +208,7 @@ def train_model(data_dir: str, annotations_file: str, epochs: int = 100,
 
 
 def test_model(model_path: str, test_data_dir: str, test_annotations: str, 
-               output_dir: str = 'test_results'):
+               output_dir: str = 'test_results', same_folder_mode: bool = False):
     """测试训练好的模型"""
     
     print("="*60)
@@ -215,7 +228,9 @@ def test_model(model_path: str, test_data_dir: str, test_annotations: str,
         return
     
     # 加载测试数据
-    loader = FishLandmarkDataLoader(test_data_dir)
+    if same_folder_mode:
+        print("📂 使用同文件夹模式：图像和JSON文件在同一目录")
+    loader = FishLandmarkDataLoader(test_data_dir, same_folder_mode=same_folder_mode)
     if test_annotations.endswith('.json'):
         image_paths, landmarks_list = loader.load_from_json(test_annotations)
     else:
@@ -237,7 +252,7 @@ def test_model(model_path: str, test_data_dir: str, test_annotations: str,
     _, val_transform = create_data_transforms((256, 256))
     
     # 创建测试数据集（使用与训练相同的预处理）
-    test_dataset = FishLandmarkDataset(image_paths, landmarks_list, val_transform)
+    test_dataset = FishLandmarkDataset(image_paths, landmarks_list, val_transform)  # 使用所有关键点
     
     for i in range(len(test_dataset)):
         # 从数据集获取样本（已经过预处理）
@@ -284,13 +299,19 @@ def test_model(model_path: str, test_data_dir: str, test_annotations: str,
         save_path = os.path.join(output_dir, f"result_{i:03d}_{image_name}")
         cv2.imwrite(save_path, cv2.cvtColor(vis_image, cv2.COLOR_RGB2BGR))
         
-        # 计算鱼的精确中心
+        # 计算鱼的精确中心（使用身体中心）
         fish_center = detector.calculate_fish_center(pred_landmarks, pred_visibility)
         true_center = detector.calculate_fish_center(true_landmarks_pixel, np.ones_like(pred_visibility))
         
-        print(f"样本 {i+1:3d}: 预测中心=({fish_center[0]:.1f}, {fish_center[1]:.1f}), "
-              f"真实中心=({true_center[0]:.1f}, {true_center[1]:.1f}), "
-              f"误差={np.linalg.norm(fish_center - true_center):.1f}px")
+        # 显示身体中心和头部中心的预测结果
+        pred_body = pred_landmarks[0] if len(pred_landmarks) > 0 else [0, 0]
+        pred_head = pred_landmarks[1] if len(pred_landmarks) > 1 else [0, 0]
+        true_body = true_landmarks_pixel[0] if len(true_landmarks_pixel) > 0 else [0, 0]
+        true_head = true_landmarks_pixel[1] if len(true_landmarks_pixel) > 1 else [0, 0]
+        
+        print(f"样本 {i+1:3d}: 身体中心 预测=({pred_body[0]:.1f}, {pred_body[1]:.1f}) 真实=({true_body[0]:.1f}, {true_body[1]:.1f}) "
+              f"头部中心 预测=({pred_head[0]:.1f}, {pred_head[1]:.1f}) 真实=({true_head[0]:.1f}, {true_head[1]:.1f}) "
+              f"中心误差={np.linalg.norm(fish_center - true_center):.1f}px")
     
     # 计算总体统计
     all_errors = np.concatenate(errors)
@@ -343,6 +364,22 @@ def print_usage_examples():
        --epochs 50 \
        --batch_size 8
 
+5. 高锐度椭圆核训练 (更严格的惩罚):
+   python3 train_landmark_model.py --mode train \
+       --data_dir ./process_data \
+       --annotations ./process_data/train_annotations.json \
+       --epochs 100 \
+       --sharpness 3.0 \
+       --loss_type ellipsoid
+
+6. 高斯核损失训练:
+   python3 train_landmark_model.py --mode train \
+       --data_dir ./process_data \
+       --annotations ./process_data/train_annotations.json \
+       --epochs 100 \
+       --loss_type gaussian \
+       --sharpness 2.0
+
 🧪 测试模式示例:
 
 1. 基本测试:
@@ -353,10 +390,16 @@ def print_usage_examples():
 
 2. 自定义输出目录测试:
    python3 train_landmark_model.py --mode test \
-       --model_path ./experiments/gaussian_20250916_111317_20250916_111319/best_fish_landmark_model_gaussian.pth \
+       --model_path ./experiments/gaussian_20250922_153626_20250922_153630/best_fish_landmark_model_gaussian.pth \
+       --test_data_dir ./process_data \
+       --test_annotations ./process_data/train_annotations.json \
+       --output_dir ./my_test_results
+
+    python3 train_landmark_model.py --mode test \
+       --model_path ./experiments/ellipsoid_20250922_130057_20250922_130101/best_fish_landmark_model_ellipsoid.pth \
        --test_data_dir ./process_data \
        --test_annotations ./process_data/val_annotations.json \
-       --output_dir ./my_test_results
+       --output_dir ./my_test_results_ellipsoid
 
 📁 数据目录结构要求:
    data_dir/
@@ -370,15 +413,15 @@ def print_usage_examples():
        └── ...
 
 📄 标注文件格式:
-   # JSON格式 (推荐)
+   # JSON格式 (推荐) - 仅使用身体中心
    {
      "train_image1.jpg": {
-       "landmarks": [[100, 50], [100, 150], [100, 250]],
-       "visibility": [1, 1, 1]
+       "landmarks": [[100, 50], [100, 150]],  # [头部中心, 身体中心] - 仅使用身体中心
+       "visibility": [1, 1]
      },
      "train_image2.jpg": {
-       "landmarks": [[120, 60], [120, 160], [120, 260]],
-       "visibility": [1, 1, 0]
+       "landmarks": [[120, 60], [120, 160]],  # [头部中心, 身体中心] - 仅使用身体中心
+       "visibility": [1, 1]
      }
    }
 
@@ -397,8 +440,8 @@ def print_usage_examples():
 ⚠️  注意事项:
    - 确保数据目录包含images和landmarks子目录
    - 图像文件名和标注文件中的键名必须匹配
-   - 关键点坐标格式: [[x1, y1], [x2, y2], [x3, y3]]
-   - 可见性格式: [1, 1, 1] (1=可见, 0=不可见)
+   - 关键点坐标格式: [[x1, y1], [x2, y2]] (头部中心, 身体中心) - 仅使用身体中心
+   - 可见性格式: [1, 1] (1=可见, 0=不可见)
    - 训练过程中会自动保存最佳模型和训练配置
 """)
 
@@ -439,6 +482,13 @@ def main():
                        help='测试集比例 (默认: 0.2)')
     parser.add_argument('--val_split', type=float, default=0.2, 
                        help='验证集比例 (默认: 0.2)')
+    parser.add_argument('--same_folder_mode', action='store_true', 
+                       help='同文件夹模式：图像和JSON文件在同一目录 (默认: False)')
+    parser.add_argument('--sharpness', type=float, default=1.0, 
+                       help='锐度参数 (默认: 1.0, 值越大越锐利，惩罚越重)')
+    parser.add_argument('--loss_type', type=str, default='ellipsoid', 
+                       choices=['gaussian', 'ellipsoid'],
+                       help='损失函数类型 (默认: ellipsoid) - gaussian: 高斯核损失, ellipsoid: 椭圆核损失')
     
     # 测试参数
     parser.add_argument('--model_path', type=str, 
@@ -483,7 +533,9 @@ def main():
             backbone=args.backbone,
             save_dir=args.save_dir,
             test_split=args.test_split,
-            val_split=args.val_split
+            val_split=args.val_split,
+            sharpness=args.sharpness,
+            loss_type=args.loss_type
         )
     
     elif args.mode == 'test':

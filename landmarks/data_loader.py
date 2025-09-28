@@ -20,9 +20,10 @@ from pathlib import Path
 class FishLandmarkDataLoader:
     """鱼体关键点数据加载器"""
     
-    def __init__(self, data_dir: str):
+    def __init__(self, data_dir: str, same_folder_mode: bool = False):
         self.data_dir = Path(data_dir)
-        self.landmark_names = ['body_center']
+        self.same_folder_mode = same_folder_mode
+        self.landmark_names = ['body_center', 'head_center']
         self.num_landmarks = len(self.landmark_names)
     
     def load_from_json(self, json_path: str) -> Tuple[List[str], List[np.ndarray]]:
@@ -49,7 +50,14 @@ class FishLandmarkDataLoader:
         
         for image_name, annotation in data.items():
             # 构建完整图像路径
-            image_path = self.data_dir / "images" / image_name
+            if self.same_folder_mode:
+                # 图像和JSON文件在同一文件夹
+                json_dir = Path(json_path).parent
+                image_path = json_dir / image_name
+            else:
+                # 默认模式：图像在data_dir/images/子目录
+                image_path = self.data_dir / "images" / image_name
+            
             if not image_path.exists():
                 print(f"警告: 图像文件不存在: {image_path}")
                 continue
@@ -57,10 +65,17 @@ class FishLandmarkDataLoader:
             all_landmarks = np.array(annotation['landmarks'], dtype=np.float32)
             all_visibility = np.array(annotation.get('visibility', [1] * len(all_landmarks)))
             
-            # 只使用身体中心（第二个关键点，索引为1）
+            # 使用身体中心和头部中心（索引为1和0）
             if len(all_landmarks) >= 2:
-                landmarks = all_landmarks[1:2]  # 只取身体中心
-                visibility = all_visibility[1:2]  # 只取身体中心的可见性
+                # 重新排列关键点：身体中心在前，头部中心在后
+                landmarks = np.array([
+                    all_landmarks[1],  # 身体中心（索引1）
+                    all_landmarks[0]   # 头部中心（索引0）
+                ], dtype=np.float32)
+                visibility = np.array([
+                    all_visibility[1],  # 身体中心可见性
+                    all_visibility[0]   # 头部中心可见性
+                ], dtype=np.float32)
             else:
                 print(f"警告: 图像 {image_name} 的关键点数量不足: {len(all_landmarks)} < 2")
                 continue

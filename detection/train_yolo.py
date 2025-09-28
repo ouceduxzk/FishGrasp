@@ -9,7 +9,7 @@ Ultralytics YOLO 训练脚本
 
 示例：
   python3 detection/train_yolo.py \
-    --data ./datasets/l0_9.11/dataset.yaml \
+    --data ./datasets/l0_9.12/dataset.yaml \
     --model yolov8s.pt \
     --epochs 100 \
     --batch 16 \
@@ -22,7 +22,7 @@ Ultralytics YOLO 训练脚本
   train: images/train
   val: images/val
   test: images/test  # 可选
-  names: ["class0", "class1", ...]
+  names: ["背景", "鱿鱼"]  # 支持多类别检测
 
 依赖：
   pip install ultralytics
