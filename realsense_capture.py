@@ -240,7 +240,7 @@ def capture_and_save(pipeline, output_dir, num_frames=100, interval=0.1, wait_fo
             # 保存RGB图像
             rgb_filename = f"rgb_{frame_count:06d}.png"
             rgb_path = os.path.join(rgb_dir, rgb_filename)
-            cv2.imwrite(rgb_path, color_image_save)
+            #cv2.imwrite(rgb_path, color_image_save)
             
             # 保存可视化深度图像（彩色，可见）
             depth_filename = f"depth_{frame_count:06d}.png"
@@ -249,12 +249,12 @@ def capture_and_save(pipeline, output_dir, num_frames=100, interval=0.1, wait_fo
             # 同时保存原始深度数据（16位PNG）
             depth_raw_filename = f"depth_raw_{frame_count:06d}.png"
             depth_raw_path = os.path.join(depth_dir, depth_raw_filename)
-            cv2.imwrite(depth_raw_path, depth_image.astype(np.uint16))
+            #cv2.imwrite(depth_raw_path, depth_image.astype(np.uint16))
             
             # 保存原始深度数据为numpy数组
             depth_numpy_filename = f"depth_{frame_count:06d}.npy"
             depth_numpy_path = os.path.join(depth_dir, depth_numpy_filename)
-            np.save(depth_numpy_path, depth_image)
+            #np.save(depth_numpy_path, depth_image)
             
             # 生成并保存3D点云（如果启用）
             if save_pointcloud:

@@ -14,6 +14,7 @@ from tqdm import tqdm
 from PIL import Image
 from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
 
+
 def download_models():
     """
     下载所需的模型文件
@@ -56,11 +57,110 @@ def init_models(device="cpu"):
     # 初始化Grounding DINO
     print("正在加载Grounding DINO模型...")
     model_id = "IDEA-Research/grounding-dino-tiny"
-    processor = AutoProcessor.from_pretrained(model_id)
-    model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
+    
+    # 检查本地模型缓存目录
+    import os
+    from huggingface_hub import snapshot_download
+    
+    # 获取本地缓存路径
+    cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+    model_cache_path = os.path.join(cache_dir, "models--" + model_id.replace("/", "--"))
+    
+    if os.path.exists(model_cache_path):
+        print(f"发现本地模型缓存: {model_cache_path}")
+        print("从本地加载Grounding DINO模型...")
+        processor = AutoProcessor.from_pretrained(model_id, local_files_only=True)
+        model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id, local_files_only=True).to(device)
+    else:
+        print(f"本地未找到模型缓存，从网络下载: {model_id}")
+        print("正在下载Grounding DINO模型...")
+        processor = AutoProcessor.from_pretrained(model_id)
+        model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
+    
     print("Grounding DINO模型加载成功")
     
     return sam_predictor, model, processor
+
+def process_image_for_mask(sam_predictor, grounding_dino_model, processor, image, device="cpu"):
+    """
+    处理单张图像并返回掩码（不保存文件）
+    
+    Args:
+        sam_predictor: SAM预测器
+        grounding_dino_model: Grounding DINO模型
+        processor: Grounding DINO处理器
+        image: 输入图像cv2    
+        device: 运行设备
+    
+    Returns:
+        mask: 分割掩码，如果没有检测到目标则返回None
+    """
+    # 读取图像
+    if image is None:
+        print(f"错误：无法读取图像: ")
+        return None
+    
+    # 转换为PIL图像
+    image_pil = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    
+    # 准备文本标签
+    text_prompt = "fish crab "
+    
+    # 处理输入
+    inputs = processor(images=image_pil, text=text_prompt, return_tensors="pt").to(device)
+    
+    # 进行检测
+    with torch.no_grad():
+        outputs = grounding_dino_model(**inputs)
+    
+    # 后处理检测结果
+    results = processor.post_process_grounded_object_detection(
+        outputs,
+        inputs.input_ids,
+        text_threshold=0.25,
+        target_sizes=[image_pil.size[::-1]]
+    )
+    
+    result = results[0]
+    
+    # 打印详细的检测结果
+    print("\n检测结果详情:")
+    print(f"检测到的目标数量: {len(result['boxes'])}")
+    
+    # 如果没有检测到任何框，直接返回None，避免后续SAM预测报错
+    if len(result["boxes"]) == 0:
+        print("无检测结果，跳过SAM分割并返回None。")
+        return None
+
+    # 转换为RGB
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    
+    # 设置图像
+    sam_predictor.set_image(image_rgb)
+    
+    # 使用检测框作为提示
+    boxes = torch.tensor([box.tolist() for box in result["boxes"]], device=device)
+
+    print(f"boxes: {boxes}")
+    transformed_boxes = sam_predictor.transform.apply_boxes_torch(boxes, image_rgb.shape[:2])
+    
+    # 预测掩码
+    masks, scores, logits = sam_predictor.predict_torch(
+        point_coords=None,
+        point_labels=None,
+        boxes=transformed_boxes,
+        multimask_output=False
+    )
+    
+    # 合并所有掩码
+    combined_mask = torch.zeros_like(masks[0][0], dtype=torch.bool)
+    for mask in masks:
+        combined_mask = torch.logical_or(combined_mask, mask[0])
+    
+    # 转换为numpy数组
+    combined_mask = combined_mask.cpu().numpy()
+    
+    return combined_mask
 
 def process_image(sam_predictor, grounding_dino_model, processor, image_path, output_dir, device="cpu"):
     """
@@ -76,14 +176,18 @@ def process_image(sam_predictor, grounding_dino_model, processor, image_path, ou
     """
     # 读取图像
     image = cv2.imread(image_path)
+    process_image_cv2(sam_predictor, grounding_dino_model, processor, image, image_path, output_dir, device)
+
+
+
+def process_image_cv2(sam_predictor, grounding_dino_model, processor, image, output_dir, device="cpu"):
     if image is None:
-        print(f"错误：无法读取图像: {image_path}")
+        print(f"错误：无法读取图像: ")
         return
     
     # 转换为PIL图像
     image_pil = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
     
-    print(f"\n正在处理图像: {image_path}")
     print("尝试检测人体...")
     
     # 准备文本标签 - 修改为单个字符串
@@ -168,10 +272,11 @@ def process_image(sam_predictor, grounding_dino_model, processor, image_path, ou
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)  # 黑色文本
         
         # 保存检测结果
-        base_name = os.path.splitext(os.path.basename(image_path))[0]
-        dino_path = os.path.join(output_dir, f"{base_name}_dino_detection.png")
-        cv2.imwrite(dino_path, dino_vis)
-        print(f"已保存Grounding DINO检测结果: {dino_path}")
+        # base_name = os.path.splitext(os.path.basename(image_path))[0]
+        # dino_path = os.path.join(output_dir, f"{base_name}_dino_detection.png")
+        # cv2.imwrite(dino_path, dino_vis)
+        # print(f"已保存Grounding DINO检测结果: {dino_path}")
+        #return dino_vis
         
         # 保存裁剪出的人体区域
         for i, (box, score, label) in enumerate(zip(result["boxes"], result["scores"], result["labels"])):
@@ -184,10 +289,10 @@ def process_image(sam_predictor, grounding_dino_model, processor, image_path, ou
             
             # 裁剪人体区域
             person_crop = image[y1:y2, x1:x2]
-            if person_crop.size > 0:  # 确保裁剪区域有效
-                crop_path = os.path.join(output_dir, f"{base_name}_person_{i}.png")
-                cv2.imwrite(crop_path, person_crop)
-                print(f"已保存人体区域 {i}: {crop_path}")
+            #if person_crop.size > 0:  # 确保裁剪区域有效
+                # crop_path = os.path.join(output_dir, f"{base_name}_person_{i}.png")
+                # cv2.imwrite(crop_path, person_crop)
+                # print(f"已保存人体区域 {i}: {crop_path}")
         
         # 转换为RGB
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -214,7 +319,9 @@ def process_image(sam_predictor, grounding_dino_model, processor, image_path, ou
         
         # 转换为numpy数组
         combined_mask = combined_mask.cpu().numpy()
-        
+        print(f"combined_mask: {combined_mask}")
+        #return combined_mask
+
         # 创建输出文件名
         mask_path = os.path.join(output_dir, f"{base_name}_mask.png")
         
@@ -247,7 +354,7 @@ def process_image(sam_predictor, grounding_dino_model, processor, image_path, ou
                 cv2.imwrite(mask_crop_path, mask_crop.astype(np.uint8) * 255)
                 print(f"已保存带掩码的裁剪区域 {i}: {mask_crop_path}")
     else:
-        print(f"\n警告：在图像 {image_path} 中未检测到人体")
+        # print(f"\n警告：在图像 {image_path} 中未检测到人体")
         print("可能的原因：")
         print("1. 图像中确实没有人")
         print("2. 人体姿态不常见")

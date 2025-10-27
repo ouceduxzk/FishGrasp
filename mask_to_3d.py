@@ -23,13 +23,15 @@ import json
 
 def load_camera_intrinsics(intrinsics_file=None):
     """
-    加载相机内参
+    加载相机内参和畸变系数
     
     Args:
         intrinsics_file: 内参文件路径，如果为None则使用默认的RealSense D435i参数
     
     Returns:
         fx, fy, cx, cy: 相机内参
+        dist: 畸变系数数组
+        mtx: 相机内参矩阵
 
         calibrated matrix : 
         内参矩阵:
@@ -47,14 +49,55 @@ def load_camera_intrinsics(intrinsics_file=None):
             fy = intrinsics['fy']
             cx = intrinsics['cx']
             cy = intrinsics['cy']
+            
+            # 加载畸变系数
+            dist_coeffs = intrinsics['distortion_coefficients']
+            dist = np.array([
+                dist_coeffs['k1'],
+                dist_coeffs['k2'],
+                dist_coeffs['p1'],
+                dist_coeffs['p2'],
+                dist_coeffs['k3']
+            ], dtype=np.float32)
+            
+            # 构建相机矩阵
+            mtx = np.array([
+                [fx, 0, cx],
+                [0, fy, cy],
+                [0, 0, 1]
+            ], dtype=np.float32)
     else:
         # 默认RealSense D435i参数 (640x480)
         fx = 615.0  # 焦距x
         fy = 615.0  # 焦距y
         cx = 320.0  # 主点x
         cy = 240.0  # 主点y
+        
+        # 默认无畸变
+        dist = np.zeros(5, dtype=np.float32)
+        
+        # 构建相机矩阵
+        mtx = np.array([
+            [fx, 0, cx],
+            [0, fy, cy],
+            [0, 0, 1]
+        ], dtype=np.float32)
     
-    return fx, fy, cx, cy
+    return fx, fy, cx, cy, dist, mtx
+
+def undistort_image(image, mtx, dist):
+    """
+    校正图像畸变
+    
+    Args:
+        image: 输入图像
+        mtx: 相机内参矩阵
+        dist: 畸变系数
+    
+    Returns:
+        undistorted_image: 校正后的图像
+    """
+    return cv2.undistort(image, mtx, dist)
 
 def load_depth_image(depth_path):
     """
@@ -84,15 +127,17 @@ def load_depth_image(depth_path):
     
     return depth_array
 
-def mask_to_3d_pointcloud(rgb_image, depth_image, mask, fx, fy, cx, cy, min_depth=0.1, max_depth=10.0):
+def mask_to_3d_pointcloud(rgb_image, depth_image, mask, fx, fy, cx, cy, mtx=None, dist=None, min_depth=0.1, max_depth=10.0):
     """
-    将掩码区域转换为3D点云
+    将掩码区域转换为3D点云（支持畸变校正）
     
     Args:
         rgb_image: RGB图像 (H, W, 3)
         depth_image: 深度图像 (H, W) 单位: 米
         mask: 二值掩码 (H, W)
         fx, fy, cx, cy: 相机内参
+        mtx: 相机内参矩阵（用于畸变校正）
+        dist: 畸变系数（用于畸变校正）
         min_depth: 最小深度阈值 (米)
         max_depth: 最大深度阈值 (米)
     
@@ -100,7 +145,15 @@ def mask_to_3d_pointcloud(rgb_image, depth_image, mask, fx, fy, cx, cy, min_dept
         points: 3D点坐标 (N, 3)
         colors: RGB颜色 (N, 3)
     """
-    height, width = depth_image.shape
+    # 如果提供了畸变系数，先校正图像
+    if mtx is not None and dist is not None:
+        print("正在校正图像畸变...")
+        rgb_image = undistort_image(rgb_image, mtx, dist)
+        #depth_image = undistort_image(depth_image, mtx, dist)
+        #mask = undistort_image(mask, mtx, dist)
+        print("图像畸变校正完成")
+    
+    height, width = rgb_image.shape[:2]
     
     # 创建网格坐标
     y_coords, x_coords = np.meshgrid(np.arange(height), np.arange(width), indexing='ij')
@@ -156,9 +209,9 @@ def save_pointcloud(points, colors, output_path):
     o3d.io.write_point_cloud(output_path, pcd)
     print(f"已保存点云: {output_path} (点数: {len(points)})")
 
-def process_single_image(mask_path, rgb_path, depth_path, output_path, fx, fy, cx, cy):
+def process_single_image(mask_path, rgb_path, depth_path, output_path, fx, fy, cx, cy, mtx=None, dist=None):
     """
-    处理单张图像
+    处理单张图像（支持畸变校正）
     
     Args:
         mask_path: 掩码文件路径
@@ -166,6 +219,8 @@ def process_single_image(mask_path, rgb_path, depth_path, output_path, fx, fy, c
         depth_path: 深度图像路径
         output_path: 输出点云路径
         fx, fy, cx, cy: 相机内参
+        mtx: 相机内参矩阵（用于畸变校正）
+        dist: 畸变系数（用于畸变校正）
     """
     try:
         # 加载掩码
@@ -194,9 +249,9 @@ def process_single_image(mask_path, rgb_path, depth_path, output_path, fx, fy, c
             print(f"错误: 图像尺寸不匹配 - RGB: {rgb_image.shape}, Depth: {depth_image.shape}, Mask: {mask.shape}")
             return False
         
-        # 转换为3D点云
+        # 转换为3D点云（支持畸变校正）
         points, colors = mask_to_3d_pointcloud(
-            rgb_image, depth_image, mask, fx, fy, cx, cy
+            rgb_image, depth_image, mask, fx, fy, cx, cy, mtx, dist
         )
         
         # 保存点云
@@ -284,9 +339,18 @@ def main():
     # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # 加载相机内参
-    fx, fy, cx, cy = load_camera_intrinsics(args.intrinsics_file)
+    # 加载相机内参和畸变系数
+    fx, fy, cx, cy, dist, mtx = load_camera_intrinsics(args.intrinsics_file)
     print(f"使用相机内参: fx={fx}, fy={fy}, cx={cx}, cy={cy}")
+    
+    # 检查是否使用畸变校正
+    if np.any(dist != 0):
+        print("检测到畸变系数，将进行图像畸变校正")
+        print(f"畸变系数: k1={dist[0]:.6f}, k2={dist[1]:.6f}, k3={dist[4]:.6f}")
+    else:
+        print("未检测到畸变系数，跳过畸变校正")
+        mtx = None
+        dist = None
     
     # 找到匹配的文件
     file_pairs = find_matching_files(args.mask_dir, args.rgb_dir, args.depth_dir)
@@ -307,7 +371,7 @@ def main():
             file_pair['rgb'],
             file_pair['depth'],
             output_path,
-            fx, fy, cx, cy
+            fx, fy, cx, cy, mtx, dist
         )
         
         if success:
