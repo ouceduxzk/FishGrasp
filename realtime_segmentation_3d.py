@@ -59,9 +59,24 @@ for _p in _extra_paths:
     except Exception:
         pass
 
+# 导入鱼容器跟踪器
+try:
+    from FishContainerTracker import FishContainerTracker
+except ImportError:
+    print("[警告] 无法导入 FishContainerTracker，将跳过重量跟踪功能")
+    FishContainerTracker = None
+
+# 导入位置求解器
+try:
+    from PositionSolver import PositionSolver, ContainerConfig
+except ImportError:
+    print("[警告] 无法导入 PositionSolver，将跳过位置预测功能")
+    PositionSolver = None
+    ContainerConfig = None
+
 class RealtimeSegmentation3D:
     def __init__(self, output_dir, device="cpu", save_pointcloud=True, intrinsics_file=None, hand_eye_file=None, bbox_selection="highest_confidence", debug=False, use_yolo=False, yolo_weights=None,
-                 grasp_point_mode: str = "centroid", landmark_model_path: str = None):
+                 grasp_point_mode: str = "centroid", landmark_model_path: str = None, enable_weight_tracking: bool = True, max_container_weight: float = 12.5):
         """
         初始化实时分割和3D点云生成器
         
@@ -75,6 +90,10 @@ class RealtimeSegmentation3D:
             debug: 是否启用调试模式（保存所有中间文件）
             use_yolo: 是否使用YOLO作为检测器
             yolo_weights: YOLO权重路径（.pt）
+            grasp_point_mode: 抓取点模式 ("centroid" 或 "ai")
+            landmark_model_path: AI关键点模型路径
+            enable_weight_tracking: 是否启用重量跟踪
+            max_container_weight: 容器最大重量（kg）
         """
         self.output_dir = output_dir
         self.device = device
@@ -86,6 +105,9 @@ class RealtimeSegmentation3D:
         # 抓取点模式：centroid 或 ai
         self.grasp_point_mode = grasp_point_mode
         self.landmark_model_path = landmark_model_path
+        # 重量跟踪相关
+        self.enable_weight_tracking = enable_weight_tracking
+        self.max_container_weight = max_container_weight
         # 创建输出目录（仅在debug模式下创建）
         if self.debug:
             self.rgb_dir = os.path.join(output_dir, "rgb")
@@ -198,6 +220,42 @@ class RealtimeSegmentation3D:
                 except Exception as e:
                     print(f"[警告] 关键点模型初始化失败: {e}，将回退为质心模式")
                     self.grasp_point_mode = "centroid"
+
+        # 初始化鱼容器跟踪器（可选）
+        self.fish_tracker = None
+        if self.enable_weight_tracking and FishContainerTracker is not None:
+            try:
+                self.fish_tracker = FishContainerTracker(
+                    max_weight_kg=self.max_container_weight,
+                    data_file=os.path.join(self.output_dir, "fish_tracking_data.json")
+                )
+                print(f"已启用鱼容器跟踪器，最大容量: {self.max_container_weight}kg")
+            except Exception as e:
+                print(f"[警告] 鱼容器跟踪器初始化失败: {e}")
+                self.fish_tracker = None
+        else:
+            print("鱼容器跟踪器未启用")
+
+        # 初始化位置求解器（可选）
+        self.position_solver = None
+        if self.enable_weight_tracking and PositionSolver is not None:
+            try:
+                # 配置容器参数（根据实际容器尺寸调整）
+                container_config = ContainerConfig(
+                    width_mm=300.0,      # 容器宽度
+                    height_mm=200.0,     # 容器高度
+                    depth_mm=150.0,      # 容器深度
+                    grid_spacing_mm=30.0, # 网格间距
+                    margin_mm=20.0,      # 边距
+                    base_height_mm=0.0   # 基础高度
+                )
+                self.position_solver = PositionSolver(container_config)
+                print("已启用位置求解器")
+            except Exception as e:
+                print(f"[警告] 位置求解器初始化失败: {e}")
+                self.position_solver = None
+        else:
+            print("位置求解器未启用")
 
 
         import jkrc 
@@ -1112,6 +1170,41 @@ class RealtimeSegmentation3D:
         
         return smoothed_rpy
 
+    def estimate_fish_weight(self, points_gripper, volume_factor: float = 1.0) -> float:
+        """
+        根据点云估算鱼的重量
+        
+        Args:
+            points_gripper: 夹爪坐标系中的点云 (N, 3)
+            volume_factor: 体积到重量的转换因子 (kg/m³)
+            
+        Returns:
+            weight_kg: 估算的鱼重量（千克）
+        """
+        if points_gripper.size == 0 or len(points_gripper) < 3:
+            return 0.0
+        
+        # 计算点云的边界框体积
+        min_coords = np.min(points_gripper, axis=0)
+        max_coords = np.max(points_gripper, axis=0)
+        dimensions = max_coords - min_coords
+        
+        # 计算体积（立方米）
+        volume_m3 = np.prod(dimensions)
+        
+        # 应用形状因子（鱼不是完美的矩形）
+        shape_factor = 0.6  # 经验值，鱼的实际体积约为边界框的60%
+        effective_volume = volume_m3 * shape_factor
+        
+        # 估算重量（假设鱼的密度约为1000 kg/m³）
+        fish_density = 1000.0  # kg/m³
+        weight_kg = effective_volume * fish_density * volume_factor
+        
+        # 限制在合理范围内
+        weight_kg = max(0.1, min(weight_kg, 2.0))  # 0.1kg 到 2.0kg
+        
+        return weight_kg
+
     def calculate_grasp_pose_with_normal(self, points_gripper, current_tcp):
         """
         计算考虑法向量的抓取姿态
@@ -1280,6 +1373,13 @@ class RealtimeSegmentation3D:
         """
         print("开始实时处理...")
         print("按 'q' 键停止")
+        if self.fish_tracker is not None:
+            print("按 'r' 键重置容器")
+            print("按 's' 键显示状态")
+            print("按 'e' 键导出数据")
+        if self.position_solver is not None:
+            print("按 'p' 键显示放置状态")
+            print("按 'v' 键显示放置可视化")
         
 
         tcp_result = self.robot.get_tcp_position()
@@ -1390,6 +1490,21 @@ class RealtimeSegmentation3D:
                 if key == ord('q'):
                     print("用户按 'q' 键停止")
                     break
+                elif key == ord('r') and self.fish_tracker is not None:
+                    print("用户按 'r' 键重置容器")
+                    self.fish_tracker.reset_container(confirm=True)
+                elif key == ord('s') and self.fish_tracker is not None:
+                    print("用户按 's' 键显示状态")
+                    self.fish_tracker.print_status()
+                elif key == ord('e') and self.fish_tracker is not None:
+                    print("用户按 'e' 键导出数据")
+                    self.fish_tracker.export_data()
+                elif key == ord('p') and self.position_solver is not None:
+                    print("用户按 'p' 键显示放置状态")
+                    self.position_solver.print_placement_status()
+                elif key == ord('v') and self.position_solver is not None:
+                    print("用户按 'v' 键显示放置可视化")
+                    print(self.position_solver.visualize_placements())
 
                 # 根据掩码生成3D点云并保存（可选应用手眼标定）
                 points_gripper = None  # 初始化变量
@@ -1435,6 +1550,14 @@ class RealtimeSegmentation3D:
                         current_tcp = tcp_result
                         tcp_ok = True
                     print(f"当前TCP位置: {current_tcp}")
+                    
+                    # 检查容器是否已满
+                    if self.fish_tracker is not None and self.fish_tracker.is_container_full():
+                        print("📦 容器已满！停止抓取新鱼。")
+                        print("按 'r' 键重置容器，按 'q' 键退出")
+                        # 显示状态
+                        self.fish_tracker.print_status()
+                        continue
                     
                     # 计算抓取点（优先AI）
                     relative_move = None
@@ -1545,6 +1668,12 @@ class RealtimeSegmentation3D:
                     print("Step1 : 准备抓取")
                     print("相对移动量:", relative_move)
                     
+                    # 估算鱼重量（在抓取前）
+                    estimated_weight = 0.0
+                    if self.fish_tracker is not None:
+                        estimated_weight = self.estimate_fish_weight(points_gripper)
+                        print(f"🐟 估算鱼重量: {estimated_weight:.3f}kg")
+                    
                     # 机器人移动计时
                     robot_movement_start = time.time()
                     
@@ -1582,6 +1711,63 @@ class RealtimeSegmentation3D:
                     #time.sleep(0.01)
                     #robot move back to the original position
                     self.robot.linear_move(original_tcp, 0 , True, 500)
+                    
+                    # 记录鱼到跟踪器
+                    if self.fish_tracker is not None and estimated_weight > 0:
+                        # 预测最终放置位置
+                        predicted_final_pose = None
+                        if self.position_solver is not None:
+                            # 估算鱼尺寸（基于点云边界框）
+                            if points_gripper is not None and len(points_gripper) > 0:
+                                min_coords = np.min(points_gripper, axis=0)
+                                max_coords = np.max(points_gripper, axis=0)
+                                fish_size_mm = (max_coords - min_coords) * 1000.0  # 转换为mm
+                                
+                                # 获取下一个鱼ID
+                                next_fish_id = self.fish_tracker.current_fish_id + 1
+                                
+                                # 预测放置位置
+                                placement = self.position_solver.find_optimal_position(
+                                    fish_id=next_fish_id,
+                                    fish_size_mm=fish_size_mm
+                                )
+                                
+                                if placement:
+                                    # 将容器坐标转换为机器人坐标系
+                                    # 假设容器在机器人工作空间中的位置
+                                    container_offset = [500.0, 0.0, 100.0]  # 容器在机器人坐标系中的偏移
+                                    predicted_final_pose = [
+                                        container_offset[0] + placement.x_mm,
+                                        container_offset[1] + placement.y_mm,
+                                        container_offset[2] + placement.z_mm,
+                                        0.0, 0.0, 0.0  # 末端姿态
+                                    ]
+                                    print(f"📍 预测放置位置: ({placement.x_mm:.1f}, {placement.y_mm:.1f}, {placement.z_mm:.1f})mm")
+                                else:
+                                    print("⚠️  无法找到合适的放置位置")
+                        
+                        # 添加鱼记录
+                        fish_id = self.fish_tracker.add_fish(
+                            weight_kg=estimated_weight,
+                            initial_pose=current_tcp,
+                            grasp_angle=angle_rad
+                        )
+                        
+                        # 更新鱼状态为已放置
+                        processing_time = time.time() - robot_movement_start
+                        self.fish_tracker.update_fish_status(
+                            fish_id=fish_id,
+                            status="placed",
+                            final_pose=predicted_final_pose,
+                            processing_time=processing_time
+                        )
+                        
+                        # 显示容器状态
+                        self.fish_tracker.print_status()
+                        
+                        # 显示位置求解器状态
+                        if self.position_solver is not None:
+                            self.position_solver.print_placement_status()
                    
                     robot_movement_time = time.time() - robot_movement_start
                     self.timers['robot_movement'].append(robot_movement_time)
@@ -1653,6 +1839,10 @@ def main():
                       help='抓取点模式: centroid(点云质心) 或 ai(使用AI身体中心)')
     parser.add_argument('--landmark_model_path', type=str, default=None,
                       help='AI身体中心模型路径 (.pth)，当 grasp_point_mode=ai 时必需')
+    parser.add_argument('--enable_weight_tracking', action='store_true',
+                      help='启用鱼重量跟踪功能')
+    parser.add_argument('--max_container_weight', type=float, default=12.5,
+                      help='容器最大重量（kg），默认12.5kg')
     
     args = parser.parse_args()
     
@@ -1669,7 +1859,9 @@ def main():
             use_yolo=args.use_yolo,
             yolo_weights=args.yolo_weights,
             grasp_point_mode=args.grasp_point_mode,
-            landmark_model_path=args.landmark_model_path
+            landmark_model_path=args.landmark_model_path,
+            enable_weight_tracking=args.enable_weight_tracking,
+            max_container_weight=args.max_container_weight
         )
         
         # 运行实时处理
