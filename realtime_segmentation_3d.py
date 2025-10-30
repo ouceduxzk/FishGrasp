@@ -76,7 +76,7 @@ except ImportError:
 
 class RealtimeSegmentation3D:
     def __init__(self, output_dir, device="cpu", save_pointcloud=True, intrinsics_file=None, hand_eye_file=None, bbox_selection="highest_confidence", debug=False, use_yolo=False, yolo_weights=None,
-                 grasp_point_mode: str = "centroid", landmark_model_path: str = None, enable_weight_tracking: bool = True, max_container_weight: float = 12.5):
+                 grasp_point_mode: str = "centroid", landmark_model_path: str = None, enable_weight_tracking: bool = True, max_container_weight: float = 12.5, det_gray: bool = False):
         """
         初始化实时分割和3D点云生成器
         
@@ -102,6 +102,8 @@ class RealtimeSegmentation3D:
         self.debug = debug
         self.use_yolo = use_yolo
         self.yolo_weights = yolo_weights
+        # detection-only grayscale support (optional)
+        self.det_gray = det_gray
         # 抓取点模式：centroid 或 ai
         self.grasp_point_mode = grasp_point_mode
         self.landmark_model_path = landmark_model_path
@@ -296,9 +298,12 @@ class RealtimeSegmentation3D:
         
         print("="*60)
     
-    def capture_frames(self):
+    def capture_frames(self, timeout_ms=10000):
         """
         捕获RGB和深度帧
+        
+        Args:
+            timeout_ms: 等待帧的超时时间（毫秒），默认10秒
         
         Returns:
             color_image: RGB图像
@@ -306,8 +311,8 @@ class RealtimeSegmentation3D:
             success: 是否成功
         """
         try:
-            # 等待新的帧
-            frames = self.pipeline.wait_for_frames()
+            # 等待新的帧，设置超时时间
+            frames = self.pipeline.wait_for_frames(timeout_ms=timeout_ms)
             
             # 对齐深度帧到RGB帧
             aligned_frames = self.align.process(frames)
@@ -342,9 +347,84 @@ class RealtimeSegmentation3D:
             
             return color_image, depth_image, True
             
-        except Exception as e:
-            print(f"捕获帧时出错: {e}")
+        except rs.error as e:
+            if "Frame didn't arrive within" in str(e):
+                print(f"⚠️  帧超时: {e}")
+                print("   可能原因: 相机连接不稳定或USB带宽不足")
+            else:
+                print(f"⚠️  RealSense错误: {e}")
             return None, None, False
+        except Exception as e:
+            print(f"❌ 捕获帧时出错: {e}")
+            return None, None, False
+    
+    def capture_frames_with_retry(self, max_retries=3, timeout_ms=10000):
+        """
+        带重试机制的帧捕获
+        
+        Args:
+            max_retries: 最大重试次数
+            timeout_ms: 每次尝试的超时时间（毫秒）
+        
+        Returns:
+            color_image: RGB图像
+            depth_image: 深度图像 (毫米)
+            success: 是否成功
+        """
+        for attempt in range(max_retries):
+            color_image, depth_image, success = self.capture_frames(timeout_ms)
+            
+            if success:
+                if attempt > 0:
+                    print(f"✅ 第{attempt + 1}次尝试成功捕获帧")
+                return color_image, depth_image, True
+            else:
+                if attempt < max_retries - 1:
+                    print(f"🔄 第{attempt + 1}次尝试失败，正在重试...")
+                    time.sleep(0.5)  # 短暂等待后重试
+                else:
+                    print(f"❌ 经过{max_retries}次尝试后仍然无法捕获帧")
+        
+        return None, None, False
+    
+    def validate_camera_connection(self, timeout_ms=5000):
+        """
+        验证相机连接是否正常
+        
+        Args:
+            timeout_ms: 验证超时时间（毫秒）
+        
+        Returns:
+            bool: 相机连接是否正常
+        """
+        try:
+            print("🔍 正在验证相机连接...")
+            color_image, depth_image, success = self.capture_frames(timeout_ms)
+            
+            if success and color_image is not None and depth_image is not None:
+                print("✅ 相机连接正常")
+                return True
+            else:
+                print("❌ 相机连接异常：无法获取有效帧")
+                return False
+                
+        except Exception as e:
+            print(f"❌ 相机连接验证失败: {e}")
+            return False
+    
+    def check_camera_health(self):
+        """
+        检查相机健康状态
+        
+        Returns:
+            bool: 相机是否正常工作
+        """
+        try:
+            # 尝试快速获取一帧来检查相机状态
+            frames = self.pipeline.wait_for_frames(timeout_ms=2000)
+            return frames is not None
+        except:
+            return False
     
     # write seperate function to do detection and segmentation togther but segmentation is done for all the objects, 
     # and then we can select the  grasp object based on the distance of camera,.
@@ -364,7 +444,7 @@ class RealtimeSegmentation3D:
         detection_start = time.time()
         if getattr(self, 'use_yolo', False):
             # YOLO 路径：detect_yolo 已返回所有满足条件的框 (x1,y1,x2,y2,conf)
-            boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.25, iou=0.45, imgsz=640)
+            boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.3, iou=0.45, imgsz=640, min_area=2500)
         else:
             # GroundingDINO 路径：复用 _detect_boxes 的实现逻辑但收集全部有效框
             image_pil = Image.fromarray(cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB))
@@ -672,7 +752,7 @@ class RealtimeSegmentation3D:
         
         return boxes
 
-    def detect_yolo(self, color_image, yolo_weights_path, conf=0.5, iou=0.45, imgsz=640, min_area=1000):
+    def detect_yolo(self, color_image, yolo_weights_path, conf=0.25, iou=0.45, imgsz=640, min_area=1000):
         """
         使用Ultralytics YOLO进行鱼的检测，返回所有检测到的bbox。
         
@@ -703,9 +783,15 @@ class RealtimeSegmentation3D:
 
         # YOLO支持直接传入numpy图像；确保为RGB
         #image_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
+        #import pdb; pdb.set_trace()
         try:
+            # grayscale only for detection if enabled
+            det_input = color_image
+            if getattr(self, 'det_gray', False):
+                gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
+                det_input = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
             results = model.predict(
-                source=[color_image],
+                source=[det_input],
                 imgsz=imgsz,
                 conf=conf,
                 iou=iou,
@@ -785,8 +871,12 @@ class RealtimeSegmentation3D:
         # BGR -> RGB
         #image_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
         try:
+            det_input = color_image
+            if getattr(self, 'det_gray', False):
+                gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
+                det_input = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
             results = model.predict(
-                source=[color_image],
+                source=[det_input],
                 imgsz=imgsz,
                 conf=conf,
                 iou=iou,
@@ -1305,6 +1395,8 @@ class RealtimeSegmentation3D:
         """
         在一个窗口中显示2x2网格：RGB、检测、分割和关键点预测结果
         """
+ 
+
         # 调整图像大小
         display_size = (600, 450)
         
@@ -1381,6 +1473,10 @@ class RealtimeSegmentation3D:
             print("按 'p' 键显示放置状态")
             print("按 'v' 键显示放置可视化")
         
+        # 验证相机连接
+        if not self.validate_camera_connection():
+            print("❌ 相机连接验证失败，请检查相机连接后重试")
+            return
 
         tcp_result = self.robot.get_tcp_position()
         if isinstance(tcp_result, tuple) and len(tcp_result) == 2:
@@ -1395,13 +1491,14 @@ class RealtimeSegmentation3D:
                 # 整个循环计时开始
                 cycle_start = time.time()
                 
-                # 捕获帧
-                color_image, depth_image, success = self.capture_frames()
+                # 捕获帧（使用重试机制）
+                color_image, depth_image, success = self.capture_frames() #self.capture_frames_with_retry(max_retries=3, timeout_ms=10000)
                 if not success:
+                    print("⚠️  跳过此帧，继续处理下一帧...")
                     continue
                 
                 self.frame_count = self.frame_count + 1
-               
+                        # 这里可以添加重新连接逻辑
                 if self.frame_count < 10 :
                     print(f"跳过前10帧，等待相机稳定...")
                     continue
@@ -1435,7 +1532,7 @@ class RealtimeSegmentation3D:
                 if mask_vis is not None:
                     # 重新运行检测以获取边界框可视化
                     if getattr(self, 'use_yolo', False):
-                        boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.25, iou=0.45, imgsz=640)
+                        boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.5, iou=0.45, imgsz=640)
                     else:
                         boxes = self._detect_boxes(color_image)
                     
@@ -1622,8 +1719,6 @@ class RealtimeSegmentation3D:
                                 norm_grip = np.linalg.norm(dir_grip_xy) + 1e-6
                                 dir_grip_xy_unit = (dir_grip_xy / norm_grip).tolist()
 
-
-            
                                 # 当前抓取按身体中心
                                 delta_tool_mm = [body_grip_mm[0], body_grip_mm[1], body_grip_mm[2]]
                                 delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
@@ -1641,7 +1736,6 @@ class RealtimeSegmentation3D:
                                 elif angle_rad < -np.pi/2:
                                     angle_rad += np.pi
                                 
-
                                 relative_move = [delta_base_xyz[0], delta_base_xyz[1], z_offset, 0, 0, 0]
 
                                 print(f"🧮 方向与X轴的夹角(rad): {angle_rad:.4f}")
@@ -1695,22 +1789,28 @@ class RealtimeSegmentation3D:
                     #     self.robot.linear_move(original_tcp, 0 , True, 400)
                     #     self.robot.set_digital_output(0, 0, 0)
                     #     continue
-                    self.robot.linear_move(original_tcp, 0 , True, 500)
+                    
+                    self.robot.linear_move([original_tcp[0], original_tcp[1],original_tcp[2]+10, original_tcp[3],original_tcp[4], original_tcp[5]], 0 , True, 40)
 
                     print(f"旋转基座{angle_rad:.4f}弧度")
-                    ret = self.robot.joint_move([-np.pi  * 0.6, 0, 0, 0, 0, angle_rad -  np.pi * 0.6], 1, True, 1)
-                    ret = self.robot.linear_move([0, 0, -350, 0, 0, 0], 1 , True, 500)
+                    #ret = self.robot.joint_move([np.pi  * 0.3, 0, 0, 0, 0, angle_rad -  np.pi * 0.3], 1, True, 1)
+                    #ret = self.robot.linear_move([0, 0, 0, 0, 0, 0], 1 , True, 500)
+                    joint_pos=[(-108.292)*np.pi/180, (71.728)*np.pi/180,(-69.117)*np.pi/180, (85.922)*np.pi/180, (-269.575)*np.pi/180, (159.928)*np.pi/180]  
+                    ret = self.robot.joint_move(joint_pos, 0, True, 1)
+                    ret = self.robot.linear_move([0, 0, -100, 0, 0, 0], 1 , True, 50)
 
                     self.robot.set_digital_output(0, 0, 0)
                     time.sleep(0.4)
-                    ret = self.robot.linear_move([0, 0, 350, 0, 0, 0], 1 , True, 500)
-                    ret = self.robot.joint_move([np.pi  * 0.6, 0, 0, 0, 0, 0], 1, True, 2)
-                    ret = self.robot.joint_move([0, 0, 0, 0, 0,  np.pi * 0.6 - angle_rad], 1, True, 2)
-                
+                    ret = self.robot.linear_move([0, 0, 100, 0, 0, 0], 1 , True, 50)
+                    #ret = self.robot.joint_move([-np.pi  * 0.3, 0, 0, 0, 0, 0], 1, True, 2)
+                    #ret = self.robot.joint_move([0, 0, 0, 0, 0,  np.pi * 0.3 - angle_rad], 1, True, 2)
+
 
                     #time.sleep(0.01)
                     #robot move back to the original position
-                    self.robot.linear_move(original_tcp, 0 , True, 500)
+                    self.robot.linear_move(original_tcp, 0 , True, 200)
+
+                    time.sleep(0.5)
                     
                     # 记录鱼到跟踪器
                     if self.fish_tracker is not None and estimated_weight > 0:
@@ -1834,6 +1934,8 @@ def main():
                       help='使用YOLO作为检测器（替代Grounding DINO）')
     parser.add_argument('--yolo_weights', type=str, default=None,
                       help='YOLO权重文件(.pt)路径（与 --use_yolo 搭配使用）')
+    parser.add_argument('--det_gray', action='store_true',
+                      help='仅在检测阶段使用灰度图像（SAM与抓取保持RGB）')
     parser.add_argument('--grasp_point_mode', type=str, default='centroid',
                       choices=['centroid', 'ai'],
                       help='抓取点模式: centroid(点云质心) 或 ai(使用AI身体中心)')
@@ -1861,9 +1963,9 @@ def main():
             grasp_point_mode=args.grasp_point_mode,
             landmark_model_path=args.landmark_model_path,
             enable_weight_tracking=args.enable_weight_tracking,
-            max_container_weight=args.max_container_weight
+            max_container_weight=args.max_container_weight,
+            det_gray=args.det_gray
         )
-        
         # 运行实时处理
         processor.run_realtime(
             max_frames=args.max_frames,
