@@ -19,27 +19,74 @@ import numpy as np
 import cv2
 import pyrealsense2 as rs
 
-def setup_realsense(width=640, height=480, depth_width=640, depth_height=480, fps=30):
-    """设置RealSense相机配置"""
+def setup_realsense(width=640, height=480, depth_width=640, depth_height=480, fps=30, disable_auto_white_balance=True, manual_white_balance=4600):
+    """设置RealSense相机配置（带回退策略）"""
     pipeline = rs.pipeline()
-    config = rs.config()
-    
-    # 配置RGB流
-    config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
-    
-    # 配置深度流
-    config.enable_stream(rs.stream.depth, depth_width, depth_height, rs.format.z16, fps)
-    
-    # 启动管道
+
+    attempts = [
+        {"color": (width, height, rs.format.bgr8, fps), "depth": (depth_width, depth_height, rs.format.z16, fps), "label": "bgr8+z16"},
+        {"color": (640, 480, rs.format.bgr8, 30), "depth": (640, 480, rs.format.z16, 30), "label": "640x480@30 bgr8+z16"},
+        {"color": (640, 480, rs.format.yuyv, 30), "depth": (640, 480, rs.format.z16, 30), "label": "yuyv+z16"},
+        {"color": None, "depth": (640, 480, rs.format.z16, 30), "label": "depth-only"},
+        {"color": "auto", "depth": "auto", "label": "librealsense-auto"},
+    ]
+
+    last_error = None
+    for attempt in attempts:
+        try:
+            config = rs.config()
+            if attempt["color"] == "auto" and attempt["depth"] == "auto":
+                profile = pipeline.start()
+                print("RealSense相机启动成功 (自动配置)")
+                _configure_sensor_options(pipeline, disable_auto_white_balance, manual_white_balance)
+                return pipeline, config
+            if attempt["color"] is not None:
+                cw, ch, cf, cfps = attempt["color"]
+                config.enable_stream(rs.stream.color, cw, ch, cf, cfps)
+            if attempt["depth"] is not None:
+                dw, dh, df, dfps = attempt["depth"]
+                config.enable_stream(rs.stream.depth, dw, dh, df, dfps)
+            profile = pipeline.start(config)
+            print(f"RealSense相机启动成功 ({attempt['label']})")
+            if attempt["color"] is not None:
+                print(f"RGB流: {cw}x{ch} @ {cfps}fps")
+            if attempt["depth"] is not None:
+                print(f"深度流: {dw}x{dh} @ {dfps}fps")
+            _configure_sensor_options(pipeline, disable_auto_white_balance, manual_white_balance)
+            return pipeline, config
+        except Exception as e:
+            last_error = e
+            try:
+                pipeline.stop()
+            except Exception:
+                pass
+            pipeline = rs.pipeline()
+            print(f"尝试配置失败 ({attempt['label']}): {e}")
+
+    print(f"启动RealSense相机失败: {last_error}")
+    return None, None
+
+def _configure_sensor_options(pipeline, disable_auto_white_balance=True, manual_white_balance=4600):
+    """配置RGB传感器白平衡选项"""
     try:
-        profile = pipeline.start(config)
-        print(f"RealSense相机启动成功")
-        print(f"RGB流: {width}x{height} @ {fps}fps")
-        print(f"深度流: {depth_width}x{depth_height} @ {fps}fps")
-        return pipeline, config
+        device = pipeline.get_active_profile().get_device()
+        rgb_sensor = device.first_color_sensor()
+        if rgb_sensor is not None:
+            if disable_auto_white_balance:
+                try:
+                    rgb_sensor.set_option(rs.option.enable_auto_white_balance, 0)
+                    print("✓ 已关闭自动白平衡")
+                except Exception as e:
+                    print(f"警告: 无法关闭自动白平衡: {e}")
+            try:
+                rgb_sensor.set_option(rs.option.white_balance, manual_white_balance)
+                print(f"✓ 已设置手动白平衡: {manual_white_balance}K")
+            except Exception as e:
+                print(f"警告: 无法设置手动白平衡: {e}")
+        else:
+            print("警告: 未找到RGB传感器，跳过白平衡配置")
     except Exception as e:
-        print(f"启动RealSense相机失败: {e}")
-        return None, None
+        print(f"警告: 配置传感器选项时出错: {e}")
 
 def get_depth_array_fast(depth_frame):
     """快速获取深度数组"""
@@ -71,6 +118,10 @@ def main():
                       help='显示窗口宽度 (默认: 1280)')
     parser.add_argument('--display_height', type=int, default=480,
                       help='显示窗口高度 (默认: 480)')
+    parser.add_argument('--enable_auto_white_balance', action='store_true',
+                      help='启用自动白平衡 (默认: 关闭)')
+    parser.add_argument('--white_balance', type=int, default=5000,
+                      help='手动白平衡温度值(K) (默认: 4600K)')
     
     args = parser.parse_args()
     
@@ -88,7 +139,9 @@ def main():
         height=args.height,
         depth_width=args.depth_width,
         depth_height=args.depth_height,
-        fps=args.fps
+        fps=args.fps,
+        disable_auto_white_balance=not args.enable_auto_white_balance,
+        manual_white_balance=args.white_balance
     )
     
     if pipeline is None:
@@ -137,7 +190,7 @@ def main():
             # 检查颜色格式并转换
             if len(color_image.shape) == 3 and color_image.shape[2] == 3:
                 # RealSense输出BGR格式，转换为RGB用于显示
-                color_image_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
+                   color_image_bgr = color_image
             else:
                 continue
             
@@ -160,7 +213,7 @@ def main():
             display_width = args.display_width // 2  # 每个图像占一半宽度
             display_height = args.display_height
             
-            color_display = cv2.resize(color_image_rgb, (display_width, display_height))
+            color_display = cv2.resize(color_image_bgr, (display_width, display_height))
             depth_display = cv2.resize(depth_colormap, (display_width, display_height))
             
             # 水平拼接RGB和深度图像
