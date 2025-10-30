@@ -31,6 +31,7 @@ import torch
 from datetime import datetime
 from tqdm import tqdm
 from PIL import Image
+import json
 
 # 导入现有模块的功能
 from seg import init_models# process_image_cv2
@@ -132,13 +133,25 @@ class RealtimeSegmentation3D:
         
         # 初始化模型
         print("正在初始化AI模型...")
-        self.sam_predictor, self.grounding_dino_model, self.processor = init_models(device)
-        
+        #self.sam_predictor, self.grounding_dino_model, self.processor = init_models(device)
+        self.sam_predictor = init_models(device)
+
         if self.use_yolo:
             if not self.yolo_weights or not os.path.exists(self.yolo_weights):
                 print(f"[警告] 已启用YOLO检测，但未找到权重: {self.yolo_weights}，将回退Grounding DINO")
                 self.use_yolo = False
         
+            try:
+                from ultralytics import YOLO
+            except Exception as e:
+                print("[错误] 未找到 ultralytics，请先: pip install ultralytics")
+                print(e)
+                return []
+
+            # 加载模型（每次调用加载避免与其他依赖冲突；若频繁调用可外部缓存模型实例）
+            self.yolo_model = YOLO(self.yolo_weights)
+            print(f"已加载YOLO权重: {self.yolo_weights}")
+                
         # 初始化RealSense相机
         print("正在初始化RealSense相机...")
         self.pipeline, self.config = setup_realsense()
@@ -444,34 +457,34 @@ class RealtimeSegmentation3D:
         detection_start = time.time()
         if getattr(self, 'use_yolo', False):
             # YOLO 路径：detect_yolo 已返回所有满足条件的框 (x1,y1,x2,y2,conf)
-            boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.3, iou=0.45, imgsz=640, min_area=2500)
-        else:
-            # GroundingDINO 路径：复用 _detect_boxes 的实现逻辑但收集全部有效框
-            image_pil = Image.fromarray(cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB))
-            text_prompt = "fish. crab. marine animal"
-            inputs = self.processor(images=image_pil, text=text_prompt, return_tensors="pt").to(self.device)
-            with torch.no_grad():
-                outputs = self.grounding_dino_model(**inputs)
-            H, W = color_image.shape[0], color_image.shape[1]
-            results = self.processor.post_process_grounded_object_detection(
-                outputs,
-                inputs.input_ids,
-                text_threshold=0.3,
-                target_sizes=[image_pil.size[::-1]]
-            )
-            result = results[0]
-            boxes = []
-            if len(result.get("boxes", [])) > 0:
-                for box in result["boxes"]:
-                    x1, y1, x2, y2 = [int(c) for c in box.tolist()]
-                    x1 = max(0, min(x1, W - 1))
-                    y1 = max(0, min(y1, H - 1))
-                    x2 = max(0, min(x2, W - 1))
-                    y2 = max(0, min(y2, H - 1))
-                    area = max(0, x2 - x1) * max(0, y2 - y1)
-                    if area > 1000:
-                        # 为了统一，与 YOLO 一样附上一个伪置信度 1.0
-                        boxes.append((x1, y1, x2, y2, 1.0))
+            boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.25, iou=0.45, imgsz=640, min_area=2500)
+        # else:
+        #     # GroundingDINO 路径：复用 _detect_boxes 的实现逻辑但收集全部有效框
+        #     image_pil = Image.fromarray(cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB))
+        #     text_prompt = "fish. crab. marine animal"
+        #     inputs = self.processor(images=image_pil, text=text_prompt, return_tensors="pt").to(self.device)
+        #     with torch.no_grad():
+        #         outputs = self.grounding_dino_model(**inputs)
+        #     H, W = color_image.shape[0], color_image.shape[1]
+        #     results = self.processor.post_process_grounded_object_detection(
+        #         outputs,
+        #         inputs.input_ids,
+        #         text_threshold=0.3,
+        #         target_sizes=[image_pil.size[::-1]]
+        #     )
+        #     result = results[0]
+        #     boxes = []
+        #     if len(result.get("boxes", [])) > 0:
+        #         for box in result["boxes"]:
+        #             x1, y1, x2, y2 = [int(c) for c in box.tolist()]
+        #             x1 = max(0, min(x1, W - 1))
+        #             y1 = max(0, min(y1, H - 1))
+        #             x2 = max(0, min(x2, W - 1))
+        #             y2 = max(0, min(y2, H - 1))
+        #             area = max(0, x2 - x1) * max(0, y2 - y1)
+        #             if area > 1000:
+        #                 # 为了统一，与 YOLO 一样附上一个伪置信度 1.0
+        #                 boxes.append((x1, y1, x2, y2, 1.0))
         detection_time = time.time() - detection_start
         self.timers['detection'].append(detection_time)
         print(f"⏱️  detection(all): {detection_time:.3f}s  候选数: {len(boxes) if boxes else 0}")
@@ -578,33 +591,36 @@ class RealtimeSegmentation3D:
         本地完成检测->分割 返回用于显示的单通道uint8掩码（0/255）。
         based on confidence score,只选择一条鱼进行分割，无检测时返回None。
         """
-        # 检测（只选择一条鱼）
+        # 检测（选择置信度最高的一条鱼）
         detection_start = time.time()
-        if getattr(self, 'use_yolo', False):
-            boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.25, iou=0.45, imgsz=640)
-        else:
-            boxes = self._detect_boxes(color_image)
+        boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.25, iou=0.45, imgsz=640)
+        # 根据置信度排序，优先选择最高置信度
+        if boxes and len(boxes[0]) >= 5:
+            try:
+                boxes.sort(key=lambda b: b[4] if len(b) >= 5 else 0.0, reverse=True)
+            except Exception:
+                pass
         detection_time = time.time() - detection_start
         self.timers['detection'].append(detection_time)
         print(f"⏱️  detection: {detection_time:.3f}s")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         base_name = f"frame_{self.frame_count:06d}_{timestamp}"
         
-        # 保存检测可视化（仅在debug模式下）
-        if self.debug:
-            det_vis = color_image.copy()
-            if len(boxes) > 0:
-                # 只标记选中的鱼（绿色框）
-                x1, y1, x2, y2, confidence = boxes[0]
-                cv2.rectangle(det_vis, (x1, y1), (x2, y2), (0, 255, 0), 3)  # 绿色粗框表示选中的鱼
-                cv2.putText(det_vis, f"SELECTED (conf: {confidence:.2f})", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        # # 保存检测可视化（仅在debug模式下）
+        # if self.debug:
+        #     det_vis = color_image.copy()
+        #     if len(boxes) > 0:
+        #         # 只标记选中的鱼（绿色框）
+        #         x1, y1, x2, y2, confidence = boxes[0]
+        #         cv2.rectangle(det_vis, (x1, y1), (x2, y2), (0, 255, 0), 3)  # 绿色粗框表示选中的鱼
+        #         cv2.putText(det_vis, f"SELECTED (conf: {confidence:.2f})", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 
-                # 保存选中的鱼的裁剪图像
-                crop = color_image[y1:y2, x1:x2]
-                if crop.size > 0:
-                    cv2.imwrite(os.path.join(self.detection_dir, f"{base_name}_selected_fish.png"), crop)
+        #         # 保存选中的鱼的裁剪图像
+        #         crop = color_image[y1:y2, x1:x2]
+        #         if crop.size > 0:
+        #             cv2.imwrite(os.path.join(self.detection_dir, f"{base_name}_selected_fish.png"), crop)
                 
-                cv2.imwrite(os.path.join(self.detection_dir, f"{base_name}_dino_detection.png"), det_vis)
+        #         cv2.imwrite(os.path.join(self.detection_dir, f"{base_name}_dino_detection.png"), det_vis)
 
         if not boxes:
             print("未检测到目标，跳过分割。")
@@ -616,7 +632,7 @@ class RealtimeSegmentation3D:
             image_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
             self.sam_predictor.set_image(image_rgb)
             
-            # 只使用选中的边界框
+            # 只使用选中的边界框（最高置信度）
             x1, y1, x2, y2, confidence = boxes[0]
             boxes_tensor = torch.tensor([[x1, y1, x2, y2]], device=self.device)
             transformed_boxes = self.sam_predictor.transform.apply_boxes_torch(boxes_tensor, image_rgb.shape[:2])
@@ -690,67 +706,67 @@ class RealtimeSegmentation3D:
             print(f"分割时出错: {e}")
             return None, None
 
-    def _detect_boxes(self, color_image):
-        """
-        使用与 seg.py 相同的方式进行检测，返回bbox列表
-        只选择一条鱼进行分割和抓取
-        """
-        # 转换为PIL图像（与 seg.py 一致）
-        image_pil = Image.fromarray(cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB))
-        text_prompt = "fish. crab. marine animal"
-        inputs = self.processor(images=image_pil, text=text_prompt, return_tensors="pt").to(self.device)
-        with torch.no_grad():
-            outputs = self.grounding_dino_model(**inputs)
-        h, w = color_image.shape[0], color_image.shape[1]
-        results = self.processor.post_process_grounded_object_detection(
-            outputs,
-            inputs.input_ids,
-            text_threshold=0.3,
-            # 与 seg.py 相同的尺寸传入方式
-            target_sizes=[image_pil.size[::-1]]
-        )
-        result = results[0]
-        boxes = []
-        print("\n检测结果详情:")
-        print(f"检测到的目标数量: {len(result['boxes'])}")
-        if len(result["boxes"]) == 0:
-            return boxes
+    # def _detect_boxes(self, color_image):
+    #     """
+    #     使用与 seg.py 相同的方式进行检测，返回bbox列表
+    #     只选择一条鱼进行分割和抓取
+    #     """
+    #     # 转换为PIL图像（与 seg.py 一致）
+    #     image_pil = Image.fromarray(cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB))
+    #     text_prompt = "fish. crab. marine animal"
+    #     inputs = self.processor(images=image_pil, text=text_prompt, return_tensors="pt").to(self.device)
+    #     with torch.no_grad():
+    #         outputs = self.grounding_dino_model(**inputs)
+    #     h, w = color_image.shape[0], color_image.shape[1]
+    #     results = self.processor.post_process_grounded_object_detection(
+    #         outputs,
+    #         inputs.input_ids,
+    #         text_threshold=0.3,
+    #         # 与 seg.py 相同的尺寸传入方式
+    #         target_sizes=[image_pil.size[::-1]]
+    #     )
+    #     result = results[0]
+    #     boxes = []
+    #     print("\n检测结果详情:")
+    #     print(f"检测到的目标数量: {len(result['boxes'])}")
+    #     if len(result["boxes"]) == 0:
+    #         return boxes
         
-        # 过滤边界框：面积必须大于1000像素
-        valid_boxes = []
-        for box in result["boxes"]:
-            x1, y1, x2, y2 = [int(c) for c in box.tolist()]
-            x1 = max(0, min(x1, w - 1))
-            y1 = max(0, min(y1, h - 1))
-            x2 = max(0, min(x2, w - 1))
-            y2 = max(0, min(y2, h - 1))
+    #     # 过滤边界框：面积必须大于1000像素
+    #     valid_boxes = []
+    #     for box in result["boxes"]:
+    #         x1, y1, x2, y2 = [int(c) for c in box.tolist()]
+    #         x1 = max(0, min(x1, w - 1))
+    #         y1 = max(0, min(y1, h - 1))
+    #         x2 = max(0, min(x2, w - 1))
+    #         y2 = max(0, min(y2, h - 1))
             
-            # 计算边界框面积
-            area = (x2 - x1) * (y2 - y1)
-            if area > 1000:  # 面积过滤
-                valid_boxes.append(((x1, y1, x2, y2), area))
+    #         # 计算边界框面积
+    #         area = (x2 - x1) * (y2 - y1)
+    #         if area > 1000:  # 面积过滤
+    #             valid_boxes.append(((x1, y1, x2, y2), area))
         
-        if valid_boxes:
-            # 根据选择策略选择边界框
-            if self.bbox_selection == "smallest":
-                selected_box = min(valid_boxes, key=lambda x: x[1])
-                selection_type = "面积最小的"
-            elif self.bbox_selection == "largest":
-                selected_box = max(valid_boxes, key=lambda x: x[1])
-                selection_type = "面积最大的"
-            else:
-                # 默认选择最小的
-                selected_box = min(valid_boxes, key=lambda x: x[1])
-                selection_type = "面积最小的"
-                print(f"警告: 未知的选择策略 '{self.bbox_selection}'，使用默认策略 'smallest'")
+    #     if valid_boxes:
+    #         # 根据选择策略选择边界框
+    #         if self.bbox_selection == "smallest":
+    #             selected_box = min(valid_boxes, key=lambda x: x[1])
+    #             selection_type = "面积最小的"
+    #         elif self.bbox_selection == "largest":
+    #             selected_box = max(valid_boxes, key=lambda x: x[1])
+    #             selection_type = "面积最大的"
+    #         else:
+    #             # 默认选择最小的
+    #             selected_box = min(valid_boxes, key=lambda x: x[1])
+    #             selection_type = "面积最小的"
+    #             print(f"警告: 未知的选择策略 '{self.bbox_selection}'，使用默认策略 'smallest'")
             
-            boxes.append(selected_box[0])
-            print(f"检测到 {len(valid_boxes)} 条鱼，选择{selection_type}进行抓取，面积: {selected_box[1]} 像素")
-            print(f"选择的鱼位置: {selected_box[0]}")
-        else:
-            print("没有满足面积要求的边界框")
+    #         boxes.append(selected_box[0])
+    #         print(f"检测到 {len(valid_boxes)} 条鱼，选择{selection_type}进行抓取，面积: {selected_box[1]} 像素")
+    #         print(f"选择的鱼位置: {selected_box[0]}")
+    #     else:
+    #         print("没有满足面积要求的边界框")
         
-        return boxes
+    #     return boxes
 
     def detect_yolo(self, color_image, yolo_weights_path, conf=0.25, iou=0.45, imgsz=640, min_area=1000):
         """
@@ -767,19 +783,7 @@ class RealtimeSegmentation3D:
         Returns:
             boxes: List[Tuple[x1, y1, x2, y2, confidence]] 所有满足条件的bbox；若无则返回空列表
         """
-        try:
-            from ultralytics import YOLO
-        except Exception as e:
-            print("[错误] 未找到 ultralytics，请先: pip install ultralytics")
-            print(e)
-            return []
-
-        # 加载模型（每次调用加载避免与其他依赖冲突；若频繁调用可外部缓存模型实例）
-        try:
-            model = YOLO(yolo_weights_path)
-        except Exception as e:
-            print(f"[错误] 加载YOLO权重失败: {yolo_weights_path} -> {e}")
-            return []
+     
 
         # YOLO支持直接传入numpy图像；确保为RGB
         #image_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
@@ -790,7 +794,7 @@ class RealtimeSegmentation3D:
             if getattr(self, 'det_gray', False):
                 gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
                 det_input = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-            results = model.predict(
+            results = self.yolo_model.predict(
                 source=[det_input],
                 imgsz=imgsz,
                 conf=conf,
@@ -849,90 +853,7 @@ class RealtimeSegmentation3D:
 
         return boxes
     
-    def detect_yolo_all(self, color_image, yolo_weights_path, conf=0.5, iou=0.45, imgsz=640):
-        """
-        使用Ultralytics YOLO对单帧进行推理，返回所有检测到的bbox（不做面积过滤与单框选择）。
-        返回：List[Tuple[int,int,int,int,float,int]] -> (x1,y1,x2,y2,conf,cls)
-        """
-        try:
-            from ultralytics import YOLO
-        except Exception as e:
-            print("[错误] 未找到 ultralytics，请先: pip install ultralytics")
-            print(e)
-            return []
 
-        # 加载模型（简化为每次加载；如需优化可在外部缓存）
-        try:
-            model = YOLO(yolo_weights_path)
-        except Exception as e:
-            print(f"[错误] 加载YOLO权重失败: {yolo_weights_path} -> {e}")
-            return []
-
-        # BGR -> RGB
-        #image_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
-        try:
-            det_input = color_image
-            if getattr(self, 'det_gray', False):
-                gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
-                det_input = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-            results = model.predict(
-                source=[det_input],
-                imgsz=imgsz,
-                conf=conf,
-                iou=iou,
-                device=(0 if self.device == 'cuda' else 'cpu'),
-                verbose=False,
-                save=False,
-            )
-        except Exception as e:
-            print(f"[错误] YOLO 推理失败: {e}")
-            return []
-
-        if not results:
-            print("[YOLO] 无检测结果")
-            return []
-
-        res = results[0]
-        if not hasattr(res, 'boxes') or res.boxes is None or res.boxes.shape[0] == 0:
-            print("[YOLO] boxes 为空")
-            return []
-
-        xyxy = res.boxes.xyxy.cpu().numpy()  # (N,4)
-        conf_arr = res.boxes.conf.cpu().numpy() if hasattr(res.boxes, 'conf') else None
-        cls_arr = res.boxes.cls.cpu().numpy() if hasattr(res.boxes, 'cls') else None
-
-        all_boxes = []
-        for i, b in enumerate(xyxy):
-            x1, y1, x2, y2 = [int(round(v)) for v in b[:4].tolist()]
-            conf_v = float(conf_arr[i]) if conf_arr is not None else 0.0
-            cls_v = int(cls_arr[i]) if cls_arr is not None else -1
-            all_boxes.append((x1, y1, x2, y2, conf_v, cls_v))
-
-        print(f"[YOLO] 检测到 {len(all_boxes)} 个框（conf>={conf}）：前3个: {all_boxes[:3]}")
-        return all_boxes
-
-    def dump_detections(self, color_image):
-        """
-        将检测到的目标裁剪并保存到 detection/ 目录
-        """
-        boxes = self._detect_boxes(color_image)
-        if not boxes:
-            return 0
-        base_ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        saved = 0
-        for idx, (x1, y1, x2, y2) in enumerate(boxes):
-            crop = color_image[y1:y2, x1:x2]
-            if crop.size == 0:
-                continue
-            filename = f"frame_{self.frame_count:06d}_{base_ts}_det_{idx}.png"
-            path = os.path.join(self.detection_dir, filename)
-            cv2.imwrite(path, crop)
-            saved += 1
-        if saved:
-            print(f"已保存 {saved} 个检测裁剪到: {self.detection_dir}")
-        return saved
-
-    
     def generate_pointcloud(self, color_image, depth_image, mask):
         """
         从掩码生成3D点云
@@ -1478,6 +1399,15 @@ class RealtimeSegmentation3D:
             print("❌ 相机连接验证失败，请检查相机连接后重试")
             return
 
+
+        ret = self.robot.joint_move([-193.484*np.pi/180,
+                        98.108*np.pi/180, 
+                        -64.836*np.pi/180, 
+                        56.796*np.pi/180,
+                        -270.49*np.pi/180, 
+                        168.094*np.pi/180], 0, True, 1)
+
+        time.sleep(1)
         tcp_result = self.robot.get_tcp_position()
         if isinstance(tcp_result, tuple) and len(tcp_result) == 2:
             tcp_ok, original_tcp = tcp_result
@@ -1486,6 +1416,8 @@ class RealtimeSegmentation3D:
             original_tcp = tcp_result
             tcp_ok = True
 
+        fish_count = 0 # count the number of fish in the container
+        fish_path_json = json.load(open('configs/fish_paths.json'))
         try:
             while True:
                 # 整个循环计时开始
@@ -1532,7 +1464,7 @@ class RealtimeSegmentation3D:
                 if mask_vis is not None:
                     # 重新运行检测以获取边界框可视化
                     if getattr(self, 'use_yolo', False):
-                        boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.5, iou=0.45, imgsz=640)
+                        boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.15, iou=0.45, imgsz=640)
                     else:
                         boxes = self._detect_boxes(color_image)
                     
@@ -1772,102 +1704,60 @@ class RealtimeSegmentation3D:
                     robot_movement_start = time.time()
                     
                     # 执行相对移动
-                    #import pdb; pdb.set_trace()
+                    #import pdb; pdb.set_trace()    
+                    fish_count += 1
+                    if fish_count > 6:
+                        print("容器已满，停止抓取")
+                        break
+                    
                     self.robot.set_digital_output(0, 0, 1)
 
                     ret = self.robot.linear_move(relative_move, 1, True, 500)
-                    # if ret != 0:
-                    #     print(f"机器人移动失败: {ret}")
-                    #     self.robot.linear_move(original_tcp, 0 , True, 400)
-                    #     self.robot.set_digital_output(0, 0, 0)
-                    #     continue
 
                     #  robot move up of 20 cm relatively 
                     #  ret = self.robot.linear_move([current_tcp[0], current_tcp[1], current_tcp[2] -100, current_tcp[3], current_tcp[4], current_tcp[5]], 0, True, 400)
-                    # if ret != 0:
-                    #     print(f"机器人移动失败: {ret}")
-                    #     self.robot.linear_move(original_tcp, 0 , True, 400)
-                    #     self.robot.set_digital_output(0, 0, 0)
-                    #     continue
+                  
                     
-                    self.robot.linear_move([original_tcp[0], original_tcp[1],original_tcp[2]+10, original_tcp[3],original_tcp[4], original_tcp[5]], 0 , True, 40)
+                    self.robot.linear_move(original_tcp, 0 , True, 40)
 
                     print(f"旋转基座{angle_rad:.4f}弧度")
-                    #ret = self.robot.joint_move([np.pi  * 0.3, 0, 0, 0, 0, angle_rad -  np.pi * 0.3], 1, True, 1)
-                    #ret = self.robot.linear_move([0, 0, 0, 0, 0, 0], 1 , True, 500)
-                    joint_pos=[(-108.292)*np.pi/180, (71.728)*np.pi/180,(-69.117)*np.pi/180, (85.922)*np.pi/180, (-269.575)*np.pi/180, (159.928)*np.pi/180]  
-                    ret = self.robot.joint_move(joint_pos, 0, True, 1)
-                    ret = self.robot.linear_move([0, 0, -100, 0, 0, 0], 1 , True, 50)
+                   
+                    #joint_pos=[(-108.292)*np.pi/180, (71.728)*np.pi/180,(-69.117)*np.pi/180, (85.922)*np.pi/180, (-269.575)*np.pi/180, (159.928)*np.pi/180]  
+                    
+                    xy_path = fish_path_json[str(fish_count)]
+                    joint_pos1 = [0, 0, 0, 0, 0, 0]
+                    joint_pos1[0] = xy_path[0][0]
+                    joint_pos1[1] = xy_path[0][1]
+                    joint_pos1[2] = 0
+                    joint_pos1[3] = 0
+                    joint_pos1[4] = 0
+                    joint_pos1[5] = 0
+
+                    ret = self.robot.linear_move(joint_pos1, 1, True, 100)
+                    joint_pos2 = [0, 0, 0, 0, 0, 0]
+                    joint_pos2[0] = xy_path[1][0]
+                    joint_pos2[1] = xy_path[1][1]
+                    joint_pos2[2] = -200
+                    joint_pos2[3] = 0
+                    joint_pos2[4] = 0
+                    joint_pos2[5] = 0
+
+
+                    print("fish : {}".format(fish_count))
+                    print(joint_pos1)
+                    print(joint_pos2)
+                    ret = self.robot.linear_move(joint_pos2, 1, True, 200)
 
                     self.robot.set_digital_output(0, 0, 0)
-                    time.sleep(0.4)
-                    ret = self.robot.linear_move([0, 0, 100, 0, 0, 0], 1 , True, 50)
+                    time.sleep(0.1)
+                    ret = self.robot.linear_move([0, 0, 200, 0, 0, 0], 1 , True, 50)
                     #ret = self.robot.joint_move([-np.pi  * 0.3, 0, 0, 0, 0, 0], 1, True, 2)
                     #ret = self.robot.joint_move([0, 0, 0, 0, 0,  np.pi * 0.3 - angle_rad], 1, True, 2)
-
-
-                    #time.sleep(0.01)
                     #robot move back to the original position
                     self.robot.linear_move(original_tcp, 0 , True, 200)
 
-                    time.sleep(0.5)
+                    time.sleep(0.3)
                     
-                    # 记录鱼到跟踪器
-                    if self.fish_tracker is not None and estimated_weight > 0:
-                        # 预测最终放置位置
-                        predicted_final_pose = None
-                        if self.position_solver is not None:
-                            # 估算鱼尺寸（基于点云边界框）
-                            if points_gripper is not None and len(points_gripper) > 0:
-                                min_coords = np.min(points_gripper, axis=0)
-                                max_coords = np.max(points_gripper, axis=0)
-                                fish_size_mm = (max_coords - min_coords) * 1000.0  # 转换为mm
-                                
-                                # 获取下一个鱼ID
-                                next_fish_id = self.fish_tracker.current_fish_id + 1
-                                
-                                # 预测放置位置
-                                placement = self.position_solver.find_optimal_position(
-                                    fish_id=next_fish_id,
-                                    fish_size_mm=fish_size_mm
-                                )
-                                
-                                if placement:
-                                    # 将容器坐标转换为机器人坐标系
-                                    # 假设容器在机器人工作空间中的位置
-                                    container_offset = [500.0, 0.0, 100.0]  # 容器在机器人坐标系中的偏移
-                                    predicted_final_pose = [
-                                        container_offset[0] + placement.x_mm,
-                                        container_offset[1] + placement.y_mm,
-                                        container_offset[2] + placement.z_mm,
-                                        0.0, 0.0, 0.0  # 末端姿态
-                                    ]
-                                    print(f"📍 预测放置位置: ({placement.x_mm:.1f}, {placement.y_mm:.1f}, {placement.z_mm:.1f})mm")
-                                else:
-                                    print("⚠️  无法找到合适的放置位置")
-                        
-                        # 添加鱼记录
-                        fish_id = self.fish_tracker.add_fish(
-                            weight_kg=estimated_weight,
-                            initial_pose=current_tcp,
-                            grasp_angle=angle_rad
-                        )
-                        
-                        # 更新鱼状态为已放置
-                        processing_time = time.time() - robot_movement_start
-                        self.fish_tracker.update_fish_status(
-                            fish_id=fish_id,
-                            status="placed",
-                            final_pose=predicted_final_pose,
-                            processing_time=processing_time
-                        )
-                        
-                        # 显示容器状态
-                        self.fish_tracker.print_status()
-                        
-                        # 显示位置求解器状态
-                        if self.position_solver is not None:
-                            self.position_solver.print_placement_status()
                    
                     robot_movement_time = time.time() - robot_movement_start
                     self.timers['robot_movement'].append(robot_movement_time)
