@@ -367,6 +367,87 @@ class PointCloudUtils:
         return True
 
 
+# --- Additional helpers merged from point_clodu_utils.py ---
+def calculate_pointcloud_bbox(points: np.ndarray):
+    if points.size == 0:
+        return None
+    min_coords = np.min(points, axis=0)
+    max_coords = np.max(points, axis=0)
+    center = (min_coords + max_coords) / 2.0
+    dimensions = max_coords - min_coords
+    height = dimensions[2]
+    corners = []
+    for x in [min_coords[0], max_coords[0]]:
+        for y in [min_coords[1], max_coords[1]]:
+            for z in [min_coords[2], max_coords[2]]:
+                corners.append([x, y, z])
+    corners = np.array(corners)
+    try:
+        from sklearn.decomposition import PCA
+        pca = PCA(n_components=3)
+        pca.fit(points)
+        principal_axes = pca.components_
+        explained_variance = pca.explained_variance_ratio_
+    except ImportError:
+        print("sklearn未安装，跳过PCA姿态估计")
+        principal_axes = np.eye(3)
+        explained_variance = [1.0, 0.0, 0.0]
+    return {
+        'center': center,
+        'dimensions': dimensions,
+        'height': height,
+        'min_coords': min_coords,
+        'max_coords': max_coords,
+        'corners': corners,
+        'principal_axes': principal_axes,
+        'explained_variance': explained_variance,
+        'num_points': len(points)
+    }
+
+
+def _simple_plane_fitting(points: np.ndarray, centroid: np.ndarray):
+    centered_points = points - centroid
+    cov_matrix = np.cov(centered_points.T)
+    eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
+    normal = eigenvectors[:, 0]
+    if normal[2] < 0:
+        normal = -normal
+    normal = normal / np.linalg.norm(normal)
+    return normal, centroid
+
+
+def _nearest_neighbors_normal(points: np.ndarray, centroid: np.ndarray, k: int = 20):
+    distances = np.linalg.norm(points - centroid, axis=1)
+    nearest_indices = np.argsort(distances)[:k]
+    nearest_points = points[nearest_indices]
+    return _simple_plane_fitting(nearest_points, centroid)
+
+
+def calculate_surface_normal(points: np.ndarray, method: str = 'pca'):
+    if points.size == 0 or len(points) < 3:
+        return np.array([0, 0, 1]), np.array([0, 0, 0])
+    centroid = np.mean(points, axis=0)
+    if method == 'pca':
+        try:
+            from sklearn.decomposition import PCA
+            pca = PCA(n_components=3)
+            pca.fit(points)
+            normal = pca.components_[2]
+        except ImportError:
+            print("sklearn未安装，使用简单平面拟合")
+            return _simple_plane_fitting(points, centroid)
+    elif method == 'plane_fitting':
+        return _simple_plane_fitting(points, centroid)
+    elif method == 'nearest_neighbors':
+        return _nearest_neighbors_normal(points, centroid)
+    else:
+        raise ValueError(f"未知的法向量计算方法: {method}")
+    if normal[2] < 0:
+        normal = -normal
+    normal = normal / np.linalg.norm(normal)
+    return normal, centroid
+
+
 def main():
     """主函数 - 命令行接口"""
     parser = argparse.ArgumentParser(

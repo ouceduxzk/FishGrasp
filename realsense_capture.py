@@ -201,6 +201,74 @@ def _configure_sensor_options(pipeline, disable_auto_white_balance=True, manual_
     except Exception as e:
         print(f"警告: 配置传感器选项时出错: {e}")
 
+def capture_frames(pipeline, align, timeout_ms=10000):
+    """
+    捕获一帧并返回BGR彩色图与以毫米为单位的深度图。
+    返回 (color_image_bgr, depth_image_mm, success)
+    """
+    try:
+        frames = pipeline.wait_for_frames(timeout_ms=timeout_ms)
+        aligned_frames = align.process(frames)
+        color_frame = aligned_frames.get_color_frame()
+        depth_frame = aligned_frames.get_depth_frame()
+        if not color_frame or not depth_frame:
+            return None, None, False
+        color_image = np.asanyarray(color_frame.get_data())
+        height, width = depth_frame.get_height(), depth_frame.get_width()
+        depth_image = np.zeros((height, width), dtype=np.uint16)
+        for y in range(height):
+            for x in range(width):
+                dist = depth_frame.get_distance(x, y)
+                if dist > 0:
+                    depth_image[y, x] = int(dist * 1000)
+        return color_image, depth_image, True
+    except rs.error as e:
+        if "Frame didn't arrive within" in str(e):
+            print(f"⚠️  帧超时: {e}")
+            print("   可能原因: 相机连接不稳定或USB带宽不足")
+        else:
+            print(f"⚠️  RealSense错误: {e}")
+        return None, None, False
+    except Exception as e:
+        print(f"❌ 捕获帧时出错: {e}")
+        return None, None, False
+
+def capture_frames_with_retry(pipeline, align, max_retries=3, timeout_ms=10000):
+    for attempt in range(max_retries):
+        color_image, depth_image, success = capture_frames(pipeline, align, timeout_ms)
+        if success:
+            if attempt > 0:
+                print(f"✅ 第{attempt + 1}次尝试成功捕获帧")
+            return color_image, depth_image, True
+        else:
+            if attempt < max_retries - 1:
+                print(f"🔄 第{attempt + 1}次尝试失败，正在重试...")
+                time.sleep(0.5)
+            else:
+                print(f"❌ 经过{max_retries}次尝试后仍然无法捕获帧")
+    return None, None, False
+
+def validate_camera_connection(pipeline, align, timeout_ms=5000):
+    try:
+        print("🔍 正在验证相机连接...")
+        color_image, depth_image, success = capture_frames(pipeline, align, timeout_ms)
+        if success and color_image is not None and depth_image is not None:
+            print("✅ 相机连接正常")
+            return True
+        else:
+            print("❌ 相机连接异常：无法获取有效帧")
+            return False
+    except Exception as e:
+        print(f"❌ 相机连接验证失败: {e}")
+        return False
+
+def check_camera_health(pipeline):
+    try:
+        frames = pipeline.wait_for_frames(timeout_ms=2000)
+        return frames is not None
+    except Exception:
+        return False
+
 def capture_and_save(pipeline, output_dir, num_frames=100, interval=0.1, wait_for_q=False, show_preview=True, save_pointcloud=True):
     """
     捕获并保存RGB和深度图像
