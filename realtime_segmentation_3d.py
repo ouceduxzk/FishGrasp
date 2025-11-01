@@ -92,7 +92,8 @@ except ImportError:
 
 class RealtimeSegmentation3D:
     def __init__(self, output_dir, device="cpu", save_pointcloud=True, intrinsics_file=None, hand_eye_file=None, bbox_selection="highest_confidence", debug=False, use_yolo=False, yolo_weights=None,
-                 grasp_point_mode: str = "centroid", landmark_model_path: str = None, enable_weight_tracking: bool = True, max_container_weight: float = 12.5, det_gray: bool = False):
+                 grasp_point_mode: str = "centroid", landmark_model_path: str = None, enable_weight_tracking: bool = True, max_container_weight: float = 12.5, det_gray: bool = False,
+                 fish_paths_file: str = "configs/fish_paths.json", camera_calib_json: str = None, robot_config: str = "config/robot.json"):
         """
         初始化实时分割和3D点云生成器
         
@@ -126,6 +127,10 @@ class RealtimeSegmentation3D:
         # 重量跟踪相关
         self.enable_weight_tracking = enable_weight_tracking
         self.max_container_weight = max_container_weight
+        # configs
+        self.fish_paths_file = fish_paths_file
+        self.camera_calib_json = camera_calib_json
+        self.robot_config = robot_config
         # 创建输出目录（仅在debug模式下创建）
         if self.debug:
             self.rgb_dir = os.path.join(output_dir, "rgb")
@@ -217,19 +222,36 @@ class RealtimeSegmentation3D:
                     print(f"hand_eye_file 格式不正确，期望(4,4)，实际{mat.shape}，忽略。")
             except Exception as e:
                 print(f"加载手眼标定矩阵失败: {e}")
-        # 若未加载到，则使用硬编码的R、t（相机→夹爪）
+        # 若未加载到，尝试从 camera_calib_json 加载，否则使用硬编码的R、t（相机→夹爪）
         if self.hand_eye_transform is None:
-            R_default = np.array([
-                [-0.99791369, -0.06094636, -0.02130291],
-                [ 0.06027516, -0.99770511,  0.03084494],
-                [-0.02313391,  0.02949655,  0.99929714]
-            ], dtype=np.float32)
-            t_default = np.array([[0.04], [0.113], [-0.22081495]], dtype=np.float32)
-            self.hand_eye_transform = np.eye(4, dtype=np.float32)
-            self.hand_eye_transform[:3, :3] = R_default
-            self.hand_eye_transform[:3, 3:4] = t_default
-            print("使用硬编码手眼标定矩阵 (相机→夹爪):")
-            print(self.hand_eye_transform)
+            loaded_json = False
+            try:
+                if self.camera_calib_json and os.path.exists(self.camera_calib_json):
+                    with open(self.camera_calib_json, 'r', encoding='utf-8') as f:
+                        calib = json.load(f)
+                    he = calib.get('hand_eye', {})
+                    R = np.array(he.get('R', []), dtype=np.float32)
+                    t = np.array(he.get('t', []), dtype=np.float32).reshape(3, 1) if he.get('t', None) is not None else None
+                    if R.shape == (3, 3) and t is not None and t.shape == (3, 1):
+                        self.hand_eye_transform = np.eye(4, dtype=np.float32)
+                        self.hand_eye_transform[:3, :3] = R
+                        self.hand_eye_transform[:3, 3:4] = t
+                        loaded_json = True
+                        print(f"已从 JSON 加载手眼标定矩阵: {self.camera_calib_json}")
+            except Exception as e:
+                print(f"读取 camera_calib_json 失败: {e}")
+            if not loaded_json:
+                R_default = np.array([
+                    [-0.99791369, -0.06094636, -0.02130291],
+                    [ 0.06027516, -0.99770511,  0.03084494],
+                    [-0.02313391,  0.02949655,  0.99929714]
+                ], dtype=np.float32)
+                t_default = np.array([[0.04], [0.113], [-0.22081495]], dtype=np.float32)
+                self.hand_eye_transform = np.eye(4, dtype=np.float32)
+                self.hand_eye_transform[:3, :3] = R_default
+                self.hand_eye_transform[:3, 3:4] = t_default
+                print("使用硬编码手眼标定矩阵 (相机→夹爪):")
+                print(self.hand_eye_transform)
         
         print("初始化完成！")
 
@@ -714,14 +736,36 @@ class RealtimeSegmentation3D:
             return
 
 
-        ret = self.robot.joint_move([-193.484*np.pi/180,
-                        98.108*np.pi/180, 
-                        -64.836*np.pi/180, 
-                        56.796*np.pi/180,
-                        -270.49*np.pi/180, 
-                        168.094*np.pi/180], 0, True, 1)
-
-        time.sleep(1)
+        # Move to initial pose from robot config if provided
+        try:
+            if self.robot_config and os.path.exists(self.robot_config):
+                with open(self.robot_config, 'r', encoding='utf-8') as f:
+                    robot_conf = json.load(f)
+                init = robot_conf.get('initial_pose', {})
+                pose_type = init.get('type', 'joint')
+                mode = int(init.get('mode', 0))
+                blocking = bool(init.get('blocking', True))
+                speed = float(init.get('speed', 1))
+                if pose_type == 'joint':
+                    vals_deg = init.get('values_deg')
+                    vals_rad = init.get('values_rad')
+                    if vals_rad is not None:
+                        joints = [float(x) for x in vals_rad]
+                    elif vals_deg is not None:
+                        joints = [float(x) * np.pi / 180.0 for x in vals_deg]
+                    else:
+                        joints = None
+                    if joints is not None and len(joints) == 6:
+                        ret = self.robot.joint_move(joints, mode, blocking, speed)
+                        time.sleep(0.2)
+                elif pose_type == 'tcp':
+                    tcp = init.get('values_mmrad')  # [x,y,z,rx,ry,rz]
+                    if tcp is not None and len(tcp) == 6:
+                        ret = self.robot.linear_move(tcp, mode, blocking, speed)
+                        time.sleep(0.2)
+        except Exception as e:
+            print(f"加载/移动初始位姿失败: {e}")
+            
         tcp_result = self.robot.get_tcp_position()
         if isinstance(tcp_result, tuple) and len(tcp_result) == 2:
             tcp_ok, original_tcp = tcp_result
@@ -731,7 +775,31 @@ class RealtimeSegmentation3D:
             tcp_ok = True
 
         fish_count = 0 # count the number of fish in the container
-        fish_path_json = json.load(open('configs/fish_paths.json'))
+        
+        # Load fish paths path from fish_grid_params.json
+        fish_paths_path = getattr(self, 'fish_paths_file', None)
+        if fish_paths_path is None:
+            # Try to load from fish_grid_params.json
+            try:
+                grid_params_path = "configs/fish_grid_params.json"
+                with open(grid_params_path, 'r', encoding='utf-8') as f:
+                    grid_params = json.load(f)
+                fish_paths_path = grid_params.get('output', {}).get('waypoints_json_path', 'configs/fish_paths.json')
+                grid = grid_params.get('grid', {})
+                rows = int(grid.get('rows', 0))
+                cols = int(grid.get('cols', 0))
+                print(f"从 fish_grid_params.json 加载路径: {fish_paths_path}, rows:{rows}, cols:{cols}")
+            except Exception as e:
+                print(f"无法从 fish_grid_params.json 加载路径，使用默认值: {e}")
+                fish_paths_path = 'configs/fish_paths.json'
+        
+        try:
+            with open(fish_paths_path, 'r', encoding='utf-8') as f:
+                fish_path_json = json.load(f)
+        except Exception as e:
+            print(f"加载鱼路径配置失败 {fish_paths_path}: {e}")
+            fish_path_json = {}
+            
         try:
             while True:
                 # 整个循环计时开始
@@ -780,7 +848,6 @@ class RealtimeSegmentation3D:
                     #if getattr(self, 'use_yolo', False):
                     boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.15, iou=0.45, imgsz=640)
                   
-                    
                     if boxes:
                         detection_vis = color_image.copy()
                         # 绘制所有检测框
@@ -1039,24 +1106,18 @@ class RealtimeSegmentation3D:
                     # 执行相对移动
                     #import pdb; pdb.set_trace()    
                     fish_count += 1
-                    if fish_count > 6:
-                        print("容器已满，停止抓取")
-                        break
+                    counter = rows*cols
+                    fish_count %= counter
                     
                     self.robot.set_digital_output(0, 0, 1)
 
+                    # catch fish
                     ret = self.robot.linear_move(relative_move, 1, True, 500)
-
-                    #  robot move up of 20 cm relatively 
-                    #  ret = self.robot.linear_move([current_tcp[0], current_tcp[1], current_tcp[2] -100, current_tcp[3], current_tcp[4], current_tcp[5]], 0, True, 400)
                   
-                    
+                    # go back to original point
                     self.robot.linear_move(original_tcp, 0 , True, 40)
-
-                    print(f"旋转基座{angle_rad:.4f}弧度")
-                   
-                    #joint_pos=[(-108.292)*np.pi/180, (71.728)*np.pi/180,(-69.117)*np.pi/180, (85.922)*np.pi/180, (-269.575)*np.pi/180, (159.928)*np.pi/180]  
                     
+                    # get target point1
                     xy_path = fish_path_json[str(fish_count)]
                     joint_pos1 = [0, 0, 0, 0, 0, 0]
                     joint_pos1[0] = xy_path[0][0]
@@ -1075,7 +1136,6 @@ class RealtimeSegmentation3D:
                     joint_pos2[4] = 0
                     joint_pos2[5] = 0
 
-
                     target_xy = [xy_path[0][0] + xy_path[1][0], xy_path[0][1] + xy_path[1][1]]
                     start_xy = [original_tcp[0], original_tcp[1]]
 
@@ -1088,27 +1148,25 @@ class RealtimeSegmentation3D:
                     # 若仍未得到 alpha_1，则置为 0
                     if alpha_1 is None:
                         alpha_1 = 0.0
-                    ret = self.robot.linear_move([start_xy[0], start_xy[1], 200, 0, 0, 0], 1 , True, 400)
+                    ret = self.robot.linear_move([start_xy[0], start_xy[1], 0, 0, 0, 0], 1 , True, 400)
                     print("fish : {}".format(fish_count))
                     print(joint_pos1)
                     print(joint_pos2)
+                    # move to target point2
                     ret = self.robot.linear_move(joint_pos2, 1, True, 400)
 
                     offset_angle = np.pi / 2 - alpha_1 - alpha_2
                     print(f"offset_angle: {offset_angle:.4f}")
 
+                    # rotate joint6 make sure the fish is vertical
                     ret = self.robot.joint_move([0, 0, 0, 0, 0, offset_angle], 1, True, 2)
                     self.robot.set_digital_output(0, 0, 0)
                     time.sleep(0.1)
-                    ret = self.robot.linear_move([joint_pos2[0], joint_pos2[1], 200, 0, 0, 0], 1 , True, 400)
-                    #ret = self.robot.joint_move([-np.pi  * 0.3, 0, 0, 0, 0, 0], 1, True, 2)
-                    #ret = self.robot.joint_move([0, 0, 0, 0, 0,  np.pi * 0.3 - angle_rad], 1, True, 2)
-                    #robot move back to the original position
+                    ret = self.robot.linear_move([-joint_pos2[0], -joint_pos2[1], 200, 0, 0, 0], 1 , True, 400)
                     self.robot.linear_move(original_tcp, 0 , True, 200)
 
                     time.sleep(0.3)
                     
-                   
                     robot_movement_time = time.time() - robot_movement_start
                     self.timers['robot_movement'].append(robot_movement_time)
                     print(f"⏱️  robot_movement: {robot_movement_time:.3f}s")
@@ -1185,6 +1243,12 @@ def main():
                       help='启用鱼重量跟踪功能')
     parser.add_argument('--max_container_weight', type=float, default=12.5,
                       help='容器最大重量（kg），默认12.5kg')
+    parser.add_argument('--fish_paths', type=str, default='configs/fish_paths.json',
+                      help='鱼路径配置JSON文件路径 (默认: configs/fish_paths.json)')
+    parser.add_argument('--camera_calib_json', type=str, default=None,
+                      help='手眼标定JSON文件路径，包含 hand_eye.R 和 hand_eye.t')
+    parser.add_argument('--robot_config', type=str, default='configs/robot.json',
+                      help='机器人配置文件，包含初始位姿 (默认: configs/robot.json)')
     
     args = parser.parse_args()
     
@@ -1204,7 +1268,10 @@ def main():
             landmark_model_path=args.landmark_model_path,
             enable_weight_tracking=args.enable_weight_tracking,
             max_container_weight=args.max_container_weight,
-            det_gray=args.det_gray
+            det_gray=args.det_gray,
+            fish_paths_file=args.fish_paths,
+            camera_calib_json=args.camera_calib_json,
+            robot_config=args.robot_config
         )
         # 运行实时处理
         processor.run_realtime(
