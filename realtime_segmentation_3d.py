@@ -815,7 +815,11 @@ class RealtimeSegmentation3D:
                         # 这里可以添加重新连接逻辑
                 if self.frame_count < 10 :
                     print(f"跳过前10帧，等待相机稳定...")
+                    if self.frame_count == 9 and show_preview:
+                        self.show_preview(color_image, depth_image, None, None, None)
+                        cv2.waitKey(1)
                     continue
+
                 # 检测 + 分割 + 落盘（最近目标选择）
                 mask_vis, base_name = self.detect_and_segment_and_dump_all(color_image, depth_image)
                 
