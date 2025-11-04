@@ -29,6 +29,76 @@ class ContainerConfig:
     margin_mm: float = 20.0      # Margin from container edges
     base_height_mm: float = 0.0  # Base height of container
 
+    @classmethod
+    def from_params_json(
+        cls,
+        json_path: str,
+        default_depth_mm: float = 150.0,
+        default_grid_spacing_mm: float = 30.0,
+        default_margin_mm: float = 20.0,
+        default_base_height_mm: float = 0.0,
+    ) -> "ContainerConfig":
+        """
+        Load container-related parameters from fish_grid_params.json.
+
+        Mapping rules:
+        - box.size_mm is [height_x_mm, width_y_mm]; map to height_mm and width_mm
+        - depth/grid_spacing/margin/base_height may be absent; fallback to defaults
+        """
+        import json
+        from pathlib import Path
+        data = json.loads(Path(json_path).read_text(encoding="utf-8"))
+
+        box = data.get("box", {})
+        size = box.get("size_mm", [200.0, 300.0])
+        # size_mm: [height_x_mm, width_y_mm]
+        height_x_mm = float(size[0]) if len(size) > 0 else 200.0
+        width_y_mm = float(size[1]) if len(size) > 1 else 300.0
+
+        depth_mm = float(box.get("depth_mm", default_depth_mm))
+        grid_spacing_mm = float(box.get("grid_spacing_mm", default_grid_spacing_mm))
+        margin_mm = float(box.get("x_margin_mm", box.get("margin_mm", default_margin_mm)))
+        base_height_mm = float(box.get("base_height_mm", default_base_height_mm))
+
+        return cls(
+            width_mm=width_y_mm,
+            height_mm=height_x_mm,
+            depth_mm=depth_mm,
+            grid_spacing_mm=grid_spacing_mm,
+            margin_mm=margin_mm,
+            base_height_mm=base_height_mm,
+        )
+
+    @staticmethod
+    def load_grid_params(json_path: str):
+        """
+        Convenience loader for grid/box planning parameters used by PositionSolver.
+        Returns a dict with keys: rows, cols, order, box_size_mm, corner_xy_mm,
+        x_margin_mm, y_margin_mm, approach_factor, place_x_mm, place_factor.
+        """
+        import json
+        from pathlib import Path
+        data = json.loads(Path(json_path).read_text(encoding="utf-8"))
+        grid = data.get("grid", {})
+        box = data.get("box", {})
+        rule = data.get("waypoint_rule", {})
+
+        size = box.get("size_mm", [200.0, 300.0])
+        corner = box.get("top_right_corner_mm", [0.0, 0.0])
+
+        return {
+            "rows": int(grid.get("rows", 1)),
+            "cols": int(grid.get("cols", 1)),
+            "order": str(grid.get("order", "row-major")),
+            "box_size_mm": (float(size[0]), float(size[1])),
+            "corner_xy_mm": (float(corner[0]), float(corner[1])),
+            "x_margin_mm": float(box.get("x_margin_mm", 0.0)),
+            "y_margin_mm": float(box.get("y_margin_mm", 0.0)),
+            "approach_factor": float(rule.get("approach_factor", 0.8)),
+            "place_x_mm": float(rule.get("place_x_mm", 0.0)),
+            "place_factor": float(rule.get("place_factor", 0.1)),
+        }
+
 
 @dataclass
 class FishPlacement:
@@ -67,125 +137,167 @@ class PositionSolver:
         self.grid_width = int((self.config.width_mm - 2 * self.config.margin_mm) / self.config.grid_spacing_mm)
         self.grid_height = int((self.config.height_mm - 2 * self.config.margin_mm) / self.config.grid_spacing_mm)
         
-        # Placement grid (3D: layer, y, x)
-        self.placement_grid = np.zeros((10, self.grid_height, self.grid_width), dtype=bool)
-        
-        # Placement history
-        self.placement_history: List[FishPlacement] = []
-        
-        # Current layer being filled
-        self.current_layer = 0
-        
-        print(f"🏗️  Position Solver initialized")
-        print(f"   Container: {self.config.width_mm}x{self.config.height_mm}x{self.config.depth_mm}mm")
-        print(f"   Grid: {self.grid_width}x{self.grid_height} cells")
-        print(f"   Spacing: {self.config.grid_spacing_mm}mm")
-    
-    def find_optimal_position(self, fish_id: int, fish_size_mm: Tuple[float, float, float] = (50, 30, 20)) -> Optional[FishPlacement]:
+
+    def plan_linear_row_centers(
+        self,
+        num_fish: int,
+        box_size_mm: Tuple[float, float] = (600.0, 4000.0),
+        corner_xy_mm: Tuple[float, float] = (-300.0, -320.0),
+        x_margin_mm: float = 0.0,
+        y_center_bias_mm: float = 0.0,
+    ) -> List[Tuple[float, float]]:
         """
-        Find the optimal position for placing a fish.
-        
+        Compute centers for placing fish in a single column along x, where fish
+        body length spans the y direction.
+
+        Coordinate convention (matches user's sketch):
+        - Robot base at (0, 0)
+        - x increases downward
+        - y increases to the right
+        - The provided corner is the box's top-right corner
+
         Args:
-            fish_id: Unique identifier for the fish
-            fish_size_mm: Fish dimensions (width, height, depth) in mm
-            
+            num_fish: Number of fish to place.
+            box_size_mm: (height_x_mm, width_y_mm) of the box.
+            corner_xy_mm: (x, y) of the top-right corner of the box relative to robot base.
+            x_margin_mm: Optional margin from top/bottom edges along x.
+            y_center_bias_mm: Optional offset to move the centers along y.
+
         Returns:
-            placement: FishPlacement object with position information, or None if no space available
+            List of (x_mm, y_mm) centers for each fish, length == num_fish.
         """
-        # Calculate required grid cells (with some margin)
-        cells_needed_x = max(1, int(fish_size_mm[0] / self.config.grid_spacing_mm) + 1)
-        cells_needed_y = max(1, int(fish_size_mm[1] / self.config.grid_spacing_mm) + 1)
-        
-        # Try to find space in current layer first
-        for layer in range(self.current_layer, min(self.current_layer + 3, self.placement_grid.shape[0])):
-            for y in range(self.grid_height - cells_needed_y + 1):
-                for x in range(self.grid_width - cells_needed_x + 1):
-                    if self._is_space_available(layer, x, y, cells_needed_x, cells_needed_y):
-                        # Found space, mark it as occupied
-                        self._mark_space_occupied(layer, x, y, cells_needed_x, cells_needed_y)
-                        
-                        # Calculate actual position in mm
-                        actual_x = self.config.margin_mm + x * self.config.grid_spacing_mm + self.config.grid_spacing_mm / 2
-                        actual_y = self.config.margin_mm + y * self.config.grid_spacing_mm + self.config.grid_spacing_mm / 2
-                        actual_z = self.config.base_height_mm + layer * 25.0  # 25mm layer height
-                        
-                        # Create placement record
-                        placement = FishPlacement(
-                            x_mm=actual_x,
-                            y_mm=actual_y,
-                            z_mm=actual_z,
-                            layer=layer,
-                            grid_x=x,
-                            grid_y=y,
-                            fish_id=fish_id,
-                            timestamp=self._get_timestamp()
-                        )
-                        
-                        # Add to history
-                        self.placement_history.append(placement)
-                        
-                        # Update current layer if needed
-                        if layer > self.current_layer:
-                            self.current_layer = layer
-                        
-                        print(f"📍 Placed fish #{fish_id} at ({actual_x:.1f}, {actual_y:.1f}, {actual_z:.1f})mm, layer {layer}")
-                        return placement
-        
-        print(f"⚠️  No space available for fish #{fish_id}")
-        return None
-    
-    def _is_space_available(self, layer: int, start_x: int, start_y: int, 
-                          cells_x: int, cells_y: int) -> bool:
-        """Check if space is available in the grid."""
-        if (layer >= self.placement_grid.shape[0] or 
-            start_x + cells_x > self.grid_width or 
-            start_y + cells_y > self.grid_height):
-            return False
-        
-        # Check if any cells in the area are occupied
-        return not np.any(self.placement_grid[layer, start_y:start_y + cells_y, start_x:start_x + cells_x])
-    
-    def _mark_space_occupied(self, layer: int, start_x: int, start_y: int, 
-                           cells_x: int, cells_y: int):
-        """Mark space as occupied in the grid."""
-        self.placement_grid[layer, start_y:start_y + cells_y, start_x:start_x + cells_x] = True
-    
-    def _get_timestamp(self) -> str:
-        """Get current timestamp string."""
-        from datetime import datetime
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    
-    def get_placement_statistics(self) -> Dict[str, Any]:
+        if num_fish <= 0:
+            return []
+
+        height_x_mm, width_y_mm = box_size_mm
+        corner_x, corner_y = corner_xy_mm
+
+        # Effective x-range inside the box after applying top/bottom margins
+        x_min = corner_x + x_margin_mm  # top edge (moving downward is +x)
+        x_max = corner_x + height_x_mm - x_margin_mm
+        if x_max <= x_min:
+            # Degenerate case: no usable space
+            center_x = (corner_x + corner_x + height_x_mm) / 2.0
+            center_y = corner_y - width_y_mm / 2.0 + y_center_bias_mm
+            return [(center_x, center_y) for _ in range(num_fish)]
+
+        # Even spacing along x inside [x_min, x_max]
+        pitch_x = (x_max - x_min) / float(num_fish)
+        centers_x = [x_min + (i + 0.5) * pitch_x for i in range(num_fish)]
+
+        # Fish body spans the y direction; place all at the center of the box in y
+        # The box extends to the LEFT from the top-right corner, so subtract width
+        center_y = corner_y - width_y_mm / 2.0 + y_center_bias_mm
+
+        return [(cx, center_y) for cx in centers_x]
+
+    def plan_grid_centers(
+        self,
+        rows: int,
+        cols: int,
+        box_size_mm: Tuple[float, float] = (600.0, 400.0),
+        corner_xy_mm: Tuple[float, float] = (-300.0, -320.0),
+        x_margin_mm: float = 0.0,
+        y_margin_mm: float = 0.0,
+        order: str = "row-major",
+    ) -> List[Tuple[float, float]]:
         """
-        Get statistics about current placements.
-        
+        Compute an r×c grid of centers inside the rectangular box.
+
+        - rows are along x (top to bottom), cols along y (right to left).
+        - The provided corner is the top-right corner of the box.
+        - x increases downward; y increases to the right.
+
+        Args:
+            rows: Number of rows (along x direction).
+            cols: Number of columns (along y direction).
+            box_size_mm: (height_x_mm, width_y_mm) of the box.
+            corner_xy_mm: (x, y) of the top-right corner.
+            x_margin_mm: Margin on top/bottom sides.
+            y_margin_mm: Margin on right/left sides.
+            order: 'row-major' or 'col-major' for output ordering.
+
         Returns:
-            stats: Dictionary containing placement statistics
+            List of (x_mm, y_mm) centers with length rows*cols.
         """
-        if not self.placement_history:
-            return {
-                "total_fish": 0,
-                "layers_used": 0,
-                "grid_utilization": 0.0,
-                "average_layer": 0.0
-            }
-        
-        total_fish = len(self.placement_history)
-        layers_used = max(p.layer for p in self.placement_history) + 1
-        average_layer = sum(p.layer for p in self.placement_history) / total_fish
-        
-        # Calculate grid utilization
-        occupied_cells = np.sum(self.placement_grid)
-        total_cells = self.placement_grid.size
-        grid_utilization = (occupied_cells / total_cells) * 100.0
-        
-        return {
-            "total_fish": total_fish,
-            "layers_used": layers_used,
-            "grid_utilization": round(grid_utilization, 1),
-            "average_layer": round(average_layer, 1),
-            "current_layer": self.current_layer
-        }
+        if rows <= 0 or cols <= 0:
+            return []
+
+        height_x_mm, width_y_mm = box_size_mm
+        corner_x, corner_y = corner_xy_mm
+
+        # Effective bounds
+        x_min = corner_x + x_margin_mm
+        x_max = corner_x + height_x_mm - x_margin_mm
+        y_right = corner_y - y_margin_mm           # right edge
+        y_left = corner_y - width_y_mm + y_margin_mm  # left edge (more negative)
+
+        if x_max <= x_min or y_right <= y_left:
+            # Fallback to single center repeated
+            cx = (corner_x + corner_x + height_x_mm) / 2.0
+            cy = corner_y - width_y_mm / 2.0
+            return [(cx, cy) for _ in range(rows * cols)]
+
+        pitch_x = (x_max - x_min) / float(rows)
+        pitch_y = (y_right - y_left) / float(cols)
+
+        centers: List[Tuple[float, float]] = []
+        if order == "row-major":
+            for r in range(rows):
+                cx = x_min + (r + 0.5) * pitch_x
+                for c in range(cols):
+                    # columns go from right to left within the box
+                    cy = y_left + (c + 0.5) * pitch_y
+                    centers.append((cx, cy))
+        else:  # col-major
+            for c in range(cols):
+                cy = y_left + (c + 0.5) * pitch_y
+                for r in range(rows):
+                    cx = x_min + (r + 0.5) * pitch_x
+                    centers.append((cx, cy))
+
+        return centers
+
+    def export_grid_waypoints_json(
+        self,
+        file_path: str,
+        rows: int,
+        cols: int,
+        box_size_mm: Tuple[float, float] = (600.0, 4000.0),
+        corner_xy_mm: Tuple[float, float] = (-300.0, -320.0),
+        x_margin_mm: float = 0.0,
+        y_margin_mm: float = 0.0,
+        approach_factor: float = 0.8,
+        place_x_mm: float = 0.0,
+        place_factor: float = 0.1,
+        order: str = "row-major",
+    ) -> str:
+        """
+        Generate an r×c grid of centers and save JSON with two waypoints per id:
+        {"1": [[x, 0.8*y], [0, 0.1*y]], ...}
+        Returns the file path.
+        """
+        import json
+        centers = self.plan_grid_centers(
+            rows=rows,
+            cols=cols,
+            box_size_mm=box_size_mm,
+            corner_xy_mm=corner_xy_mm,
+            x_margin_mm=x_margin_mm,
+            y_margin_mm=y_margin_mm,
+            order=order,
+        )
+        out = {}
+        for i, (cx, cy) in enumerate(centers, start=1):
+            out[str(i)] = [
+                [float(cx), float(approach_factor * cy)],
+                [float(place_x_mm), float(place_factor * cy)],
+            ]
+        from pathlib import Path
+        p = Path(file_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+        return str(p)
     
     def print_placement_status(self):
         """Print current placement status."""
@@ -279,37 +391,62 @@ def main():
     """Test the PositionSolver module."""
     print("Testing PositionSolver...")
     
-    # Create solver with custom config
-    config = ContainerConfig(
-        width_mm=300.0,
-        height_mm=200.0,
-        depth_mm=150.0,
-        grid_spacing_mm=30.0,
-        margin_mm=20.0
+
+    # Example A: ContainerConfig from JSON
+    try:
+        cfg = ContainerConfig.from_params_json("configs/fish_grid_params.json")
+        print(f"Loaded ContainerConfig from JSON: width={cfg.width_mm}, height={cfg.height_mm}, depth={cfg.depth_mm}")
+    except Exception as e:
+        print(f"Failed to load ContainerConfig from JSON, using defaults: {e}")
+        cfg = ContainerConfig()
+
+    # Example A: compute linear row centers
+    n = 6
+    centers = PositionSolver(cfg).plan_linear_row_centers(
+        num_fish=n,
+        box_size_mm=(cfg.height_mm, cfg.width_mm),
+        corner_xy_mm=(40.0, -300.0),
+        x_margin_mm=0.0,
+        y_center_bias_mm=0.0,
     )
-    
-    solver = PositionSolver(config)
-    
-    # Test placing some fish
-    test_fish = [
-        (1, (50, 30, 20)),
-        (2, (40, 25, 15)),
-        (3, (60, 35, 25)),
-        (4, (45, 28, 18)),
-    ]
-    
-    for fish_id, size in test_fish:
-        placement = solver.find_optimal_position(fish_id, size)
-        if placement:
-            print(f"Fish #{fish_id}: ({placement.x_mm:.1f}, {placement.y_mm:.1f}, {placement.z_mm:.1f})mm")
-        else:
-            print(f"Fish #{fish_id}: No space available")
-    
-    # Print statistics
-    solver.print_placement_status()
-    
-    # Show visualization
-    print(solver.visualize_placements(0))
+    print(f"\nPlanned {n} centers (x, y) mm (linear):")
+    for i, (cx, cy) in enumerate(centers):
+        print(f"  {i+1}: ({cx:.1f}, {cy:.1f})")
+
+    # # Example B: compute grid centers r×c
+    # r, c = 3, 2
+    # grid_centers = PositionSolver(cfg).plan_grid_centers(
+    #     rows=r,
+    #     cols=c,
+    #     box_size_mm=(cfg.height_mm, cfg.width_mm),
+    #     corner_xy_mm=(40.0, -300.0),
+    #     x_margin_mm=0.0,
+    #     y_margin_mm=0.0,
+    #     order="row-major",
+    # )
+    # print(f"\nPlanned grid centers ({r}x{c}) (x, y) mm:")
+    # for i, (cx, cy) in enumerate(grid_centers):
+    #     print(f"  {i+1}: ({cx:.1f}, {cy:.1f})")
+
+    # # Example C: export grid waypoints JSON for realtime loader
+    # # Generates keys 1..(r*c) with [[x, 0.8*y], [0, 0.1*y]]
+    # try:
+    #     path = PositionSolver(cfg).export_grid_waypoints_json(
+    #         file_path="configs/fish_paths.json",
+    #         rows=r,
+    #         cols=c,
+    #         box_size_mm=(cfg.height_mm, cfg.width_mm),
+    #         corner_xy_mm=(40.0, -300.0),
+    #         x_margin_mm=0.0,
+    #         y_margin_mm=0.0,
+    #         approach_factor=0.8,
+    #         place_x_mm=0.0,
+    #         place_factor=0.1,
+    #         order="row-major",
+    #     )
+    #     print(f"\nExported grid waypoints JSON to: {path}")
+    # except Exception as e:
+    #     print(f"Failed exporting grid JSON: {e}")
 
 
 if __name__ == "__main__":

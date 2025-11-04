@@ -100,9 +100,9 @@ def save_pointcloud_to_file(points, colors, output_path):
     
     return success
 
-def setup_realsense(width=640, height=480, depth_width=640, depth_height=480, fps=30):
+def setup_realsense(width=640, height=480, depth_width=640, depth_height=480, fps=30, disable_auto_white_balance=True, manual_white_balance=4600):
     """
-    设置RealSense相机配置
+    设置RealSense相机配置（带回退策略，避免V4L2格式协商失败）
     
     Args:
         width: RGB图像宽度
@@ -110,31 +110,164 @@ def setup_realsense(width=640, height=480, depth_width=640, depth_height=480, fp
         depth_width: 深度图像宽度
         depth_height: 深度图像高度
         fps: 帧率
-    
-    Returns:
-        pipeline: RealSense管道对象
-        config: 配置对象
+        disable_auto_white_balance: 是否关闭自动白平衡
+        manual_white_balance: 手动白平衡温度值（K）
     """
-    # 创建管道
     pipeline = rs.pipeline()
-    config = rs.config()
+
+    # 尝试的配置列表（从常见到保守）
+    attempts = [
+        {"color": (width, height, rs.format.bgr8, fps), "depth": (depth_width, depth_height, rs.format.z16, fps), "label": "bgr8+z16"},
+        {"color": (640, 480, rs.format.bgr8, 30), "depth": (640, 480, rs.format.z16, 30), "label": "640x480@30 bgr8+z16"},
+        {"color": (1280, 720, rs.format.bgr8, 30), "depth": (640, 480, rs.format.z16, 30), "label": "1280x720 color + 640x480 depth"},
+        {"color": (640, 480, rs.format.yuyv, 30), "depth": (640, 480, rs.format.z16, 30), "label": "yuyv+z16"},
+        {"color": None, "depth": (640, 480, rs.format.z16, 30), "label": "depth-only"},
+        {"color": "auto", "depth": "auto", "label": "librealsense-auto"},
+    ]
+
+    last_error = None
+    for attempt in attempts:
+        try:
+            config = rs.config()
+            if attempt["color"] == "auto" and attempt["depth"] == "auto":
+                profile = pipeline.start()  # 让librealsense自动选择可用配置
+                print("RealSense相机启动成功 (自动配置)")
+                # 配置传感器选项
+                _configure_sensor_options(pipeline, disable_auto_white_balance, manual_white_balance)
+                return pipeline, config
+            if attempt["color"] is not None:
+                cw, ch, cf, cfps = attempt["color"]
+                config.enable_stream(rs.stream.color, cw, ch, cf, cfps)
+            if attempt["depth"] is not None:
+                dw, dh, df, dfps = attempt["depth"]
+                config.enable_stream(rs.stream.depth, dw, dh, df, dfps)
+            profile = pipeline.start(config)
+            # 打印成功信息
+            print(f"RealSense相机启动成功 ({attempt['label']})")
+            if attempt["color"] is not None:
+                print(f"RGB流: {cw}x{ch} @ {cfps}fps")
+            if attempt["depth"] is not None:
+                print(f"深度流: {dw}x{dh} @ {dfps}fps")
+            
+            # 配置传感器选项
+            _configure_sensor_options(pipeline, disable_auto_white_balance, manual_white_balance)
+            return pipeline, config
+        except Exception as e:
+            last_error = e
+            try:
+                pipeline.stop()
+            except Exception:
+                pass
+            pipeline = rs.pipeline()
+            print(f"尝试配置失败 ({attempt['label']}): {e}")
+
+    print(f"启动RealSense相机失败: {last_error}")
+    return None, None
+
+def _configure_sensor_options(pipeline, disable_auto_white_balance=True, manual_white_balance=4600):
+    """
+    配置RealSense传感器选项
     
-    # 配置RGB流
-    config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
-    
-    # 配置深度流
-    config.enable_stream(rs.stream.depth, depth_width, depth_height, rs.format.z16, fps)
-    
-    # 启动管道
+    Args:
+        pipeline: RealSense管道对象
+        disable_auto_white_balance: 是否关闭自动白平衡
+        manual_white_balance: 手动白平衡温度值（K）
+    """
     try:
-        profile = pipeline.start(config)
-        print(f"RealSense相机启动成功")
-        print(f"RGB流: {width}x{height} @ {fps}fps")
-        print(f"深度流: {depth_width}x{depth_height} @ {fps}fps")
-        return pipeline, config
+        # 获取设备
+        device = pipeline.get_active_profile().get_device()
+        
+        # 获取RGB传感器
+        rgb_sensor = device.first_color_sensor()
+        
+        if rgb_sensor is not None:
+            # 关闭自动白平衡
+            if disable_auto_white_balance:
+                try:
+                    rgb_sensor.set_option(rs.option.enable_auto_white_balance, 0)
+                    print(f"✓ 已关闭自动白平衡")
+                except Exception as e:
+                    print(f"警告: 无法关闭自动白平衡: {e}")
+            
+            # 设置手动白平衡
+            try:
+                rgb_sensor.set_option(rs.option.white_balance, manual_white_balance)
+                print(f"✓ 已设置手动白平衡: {manual_white_balance}K")
+            except Exception as e:
+                print(f"警告: 无法设置手动白平衡: {e}")
+        else:
+            print("警告: 未找到RGB传感器，无法配置白平衡选项")
+            
     except Exception as e:
-        print(f"启动RealSense相机失败: {e}")
-        return None, None
+        print(f"警告: 配置传感器选项时出错: {e}")
+
+def capture_frames(pipeline, align, timeout_ms=10000):
+    """
+    捕获一帧并返回BGR彩色图与以毫米为单位的深度图。
+    返回 (color_image_bgr, depth_image_mm, success)
+    """
+    try:
+        frames = pipeline.wait_for_frames(timeout_ms=timeout_ms)
+        aligned_frames = align.process(frames)
+        color_frame = aligned_frames.get_color_frame()
+        depth_frame = aligned_frames.get_depth_frame()
+        if not color_frame or not depth_frame:
+            return None, None, False
+        color_image = np.asanyarray(color_frame.get_data())
+        height, width = depth_frame.get_height(), depth_frame.get_width()
+        depth_image = np.zeros((height, width), dtype=np.uint16)
+        for y in range(height):
+            for x in range(width):
+                dist = depth_frame.get_distance(x, y)
+                if dist > 0:
+                    depth_image[y, x] = int(dist * 1000)
+        return color_image, depth_image, True
+    except rs.error as e:
+        if "Frame didn't arrive within" in str(e):
+            print(f"⚠️  帧超时: {e}")
+            print("   可能原因: 相机连接不稳定或USB带宽不足")
+        else:
+            print(f"⚠️  RealSense错误: {e}")
+        return None, None, False
+    except Exception as e:
+        print(f"❌ 捕获帧时出错: {e}")
+        return None, None, False
+
+def capture_frames_with_retry(pipeline, align, max_retries=3, timeout_ms=10000):
+    for attempt in range(max_retries):
+        color_image, depth_image, success = capture_frames(pipeline, align, timeout_ms)
+        if success:
+            if attempt > 0:
+                print(f"✅ 第{attempt + 1}次尝试成功捕获帧")
+            return color_image, depth_image, True
+        else:
+            if attempt < max_retries - 1:
+                print(f"🔄 第{attempt + 1}次尝试失败，正在重试...")
+                time.sleep(0.5)
+            else:
+                print(f"❌ 经过{max_retries}次尝试后仍然无法捕获帧")
+    return None, None, False
+
+def validate_camera_connection(pipeline, align, timeout_ms=5000):
+    try:
+        print("🔍 正在验证相机连接...")
+        color_image, depth_image, success = capture_frames(pipeline, align, timeout_ms)
+        if success and color_image is not None and depth_image is not None:
+            print("✅ 相机连接正常")
+            return True
+        else:
+            print("❌ 相机连接异常：无法获取有效帧")
+            return False
+    except Exception as e:
+        print(f"❌ 相机连接验证失败: {e}")
+        return False
+
+def check_camera_health(pipeline):
+    try:
+        frames = pipeline.wait_for_frames(timeout_ms=2000)
+        return frames is not None
+    except Exception:
+        return False
 
 def capture_and_save(pipeline, output_dir, num_frames=100, interval=0.1, wait_for_q=False, show_preview=True, save_pointcloud=True):
     """
@@ -402,6 +535,10 @@ def main():
                       help='等待按q键停止，而不是按帧数停止')
     parser.add_argument('--no_pointcloud', action='store_true',
                       help='禁用3D点云生成和保存')
+    parser.add_argument('--enable_auto_white_balance', action='store_true',
+                      help='启用自动白平衡 (默认: 关闭)')
+    parser.add_argument('--white_balance', type=int, default=4600,
+                      help='手动白平衡温度值(K) (默认: 4600K)')
     
     args = parser.parse_args()
     
@@ -419,7 +556,9 @@ def main():
         height=args.height,
         depth_width=args.depth_width,
         depth_height=args.depth_height,
-        fps=args.fps
+        fps=args.fps,
+        disable_auto_white_balance=not args.enable_auto_white_balance,
+        manual_white_balance=args.white_balance
     )
     
     if pipeline is None:

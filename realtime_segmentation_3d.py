@@ -31,11 +31,27 @@ import torch
 from datetime import datetime
 from tqdm import tqdm
 from PIL import Image
+import json
 
 # 导入现有模块的功能
 from seg import init_models# process_image_cv2
+from util import (
+    estimate_body_angle_alpha1,
+    draw_principal_axis,
+    angle_between_2d_from_origin,
+    apply_hand_eye_transform as util_apply_hand_eye_transform,
+    tool_offset_to_base as util_tool_offset_to_base,
+)
 from mask_to_3d import mask_to_3d_pointcloud, save_pointcloud, load_camera_intrinsics
-from realsense_capture import setup_realsense, depth_to_pointcloud, save_pointcloud_to_file
+from realsense_capture import (
+    setup_realsense,
+    depth_to_pointcloud,
+    save_pointcloud_to_file,
+    capture_frames as rs_capture_frames,
+    capture_frames_with_retry as rs_capture_frames_with_retry,
+    validate_camera_connection as rs_validate_camera_connection,
+    check_camera_health as rs_check_camera_health,
+)
 # Landmark detector for AI-based grasp point estimation
 try:
     # 优先以包形式导入
@@ -76,7 +92,7 @@ except ImportError:
 
 class RealtimeSegmentation3D:
     def __init__(self, output_dir, device="cpu", save_pointcloud=True, intrinsics_file=None, hand_eye_file=None, bbox_selection="highest_confidence", debug=False, use_yolo=False, yolo_weights=None,
-                 grasp_point_mode: str = "centroid", landmark_model_path: str = None, enable_weight_tracking: bool = True, max_container_weight: float = 12.5):
+                 grasp_point_mode: str = "centroid", landmark_model_path: str = None, enable_weight_tracking: bool = True, max_container_weight: float = 12.5, det_gray: bool = False):
         """
         初始化实时分割和3D点云生成器
         
@@ -102,6 +118,8 @@ class RealtimeSegmentation3D:
         self.debug = debug
         self.use_yolo = use_yolo
         self.yolo_weights = yolo_weights
+        # detection-only grayscale support (optional)
+        self.det_gray = det_gray
         # 抓取点模式：centroid 或 ai
         self.grasp_point_mode = grasp_point_mode
         self.landmark_model_path = landmark_model_path
@@ -130,13 +148,25 @@ class RealtimeSegmentation3D:
         
         # 初始化模型
         print("正在初始化AI模型...")
-        self.sam_predictor, self.grounding_dino_model, self.processor = init_models(device)
-        
+        #self.sam_predictor, self.grounding_dino_model, self.processor = init_models(device)
+        self.sam_predictor = init_models(device)
+
         if self.use_yolo:
             if not self.yolo_weights or not os.path.exists(self.yolo_weights):
                 print(f"[警告] 已启用YOLO检测，但未找到权重: {self.yolo_weights}，将回退Grounding DINO")
                 self.use_yolo = False
         
+            try:
+                from ultralytics import YOLO
+            except Exception as e:
+                print("[错误] 未找到 ultralytics，请先: pip install ultralytics")
+                print(e)
+                return []
+
+            # 加载模型（每次调用加载避免与其他依赖冲突；若频繁调用可外部缓存模型实例）
+            self.yolo_model = YOLO(self.yolo_weights)
+            print(f"已加载YOLO权重: {self.yolo_weights}")
+                
         # 初始化RealSense相机
         print("正在初始化RealSense相机...")
         self.pipeline, self.config = setup_realsense()
@@ -296,55 +326,18 @@ class RealtimeSegmentation3D:
         
         print("="*60)
     
-    def capture_frames(self):
-        """
-        捕获RGB和深度帧
-        
-        Returns:
-            color_image: RGB图像
-            depth_image: 深度图像 (毫米)
-            success: 是否成功
-        """
-        try:
-            # 等待新的帧
-            frames = self.pipeline.wait_for_frames()
-            
-            # 对齐深度帧到RGB帧
-            aligned_frames = self.align.process(frames)
-            
-            # 获取对齐后的帧
-            color_frame = aligned_frames.get_color_frame()
-            depth_frame = aligned_frames.get_depth_frame()
-            
-            if not color_frame or not depth_frame:
-                return None, None, False
-            
-            # 转换为numpy数组（RealSense配置为bgr8，因此这里直接得到BGR格式，适用于OpenCV）
-            color_image = np.asanyarray(color_frame.get_data())
-
-            # 获取深度数据
-            height, width = depth_frame.get_height(), depth_frame.get_width()
-            depth_image = np.zeros((height, width), dtype=np.uint16)
-            
-            for y in range(height):
-                for x in range(width):
-                    dist = depth_frame.get_distance(x, y)
-                    if dist > 0:
-                        depth_image[y, x] = int(dist * 1000)  # 转换为毫米
-            
-            # 如果启用了畸变校正，校正图像
-            # if self.mtx is not None and self.dist is not None:
-            #     color_image = cv2.undistort(color_image, self.mtx, self.dist)
-            #     # # 深度图像需要转换为float32类型进行畸变校正
-            #     # depth_image_float = depth_image.astype(np.float32)
-            #     # depth_image_undistorted = cv2.undistort(depth_image_float, self.mtx, self.dist)
-            #     # depth_image = depth_image_undistorted.astype(np.uint16)
-            
-            return color_image, depth_image, True
-            
-        except Exception as e:
-            print(f"捕获帧时出错: {e}")
-            return None, None, False
+    def capture_frames(self, timeout_ms=10000):
+        """委托到 realsense_capture.capture_frames"""
+        return rs_capture_frames(self.pipeline, self.align, timeout_ms)
+    
+    def capture_frames_with_retry(self, max_retries=3, timeout_ms=10000):
+        return rs_capture_frames_with_retry(self.pipeline, self.align, max_retries, timeout_ms)
+    
+    def validate_camera_connection(self, timeout_ms=5000):
+        return rs_validate_camera_connection(self.pipeline, self.align, timeout_ms)
+    
+    def check_camera_health(self):
+        return rs_check_camera_health(self.pipeline)
     
     # write seperate function to do detection and segmentation togther but segmentation is done for all the objects, 
     # and then we can select the  grasp object based on the distance of camera,.
@@ -362,36 +355,10 @@ class RealtimeSegmentation3D:
         """
         # 1) 检测所有候选框
         detection_start = time.time()
-        if getattr(self, 'use_yolo', False):
-            # YOLO 路径：detect_yolo 已返回所有满足条件的框 (x1,y1,x2,y2,conf)
-            boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.25, iou=0.45, imgsz=640)
-        else:
-            # GroundingDINO 路径：复用 _detect_boxes 的实现逻辑但收集全部有效框
-            image_pil = Image.fromarray(cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB))
-            text_prompt = "fish. crab. marine animal"
-            inputs = self.processor(images=image_pil, text=text_prompt, return_tensors="pt").to(self.device)
-            with torch.no_grad():
-                outputs = self.grounding_dino_model(**inputs)
-            H, W = color_image.shape[0], color_image.shape[1]
-            results = self.processor.post_process_grounded_object_detection(
-                outputs,
-                inputs.input_ids,
-                text_threshold=0.3,
-                target_sizes=[image_pil.size[::-1]]
-            )
-            result = results[0]
-            boxes = []
-            if len(result.get("boxes", [])) > 0:
-                for box in result["boxes"]:
-                    x1, y1, x2, y2 = [int(c) for c in box.tolist()]
-                    x1 = max(0, min(x1, W - 1))
-                    y1 = max(0, min(y1, H - 1))
-                    x2 = max(0, min(x2, W - 1))
-                    y2 = max(0, min(y2, H - 1))
-                    area = max(0, x2 - x1) * max(0, y2 - y1)
-                    if area > 1000:
-                        # 为了统一，与 YOLO 一样附上一个伪置信度 1.0
-                        boxes.append((x1, y1, x2, y2, 1.0))
+        #if getattr(self, 'use_yolo', False):
+        # YOLO 路径：detect_yolo 已返回所有满足条件的框 (x1,y1,x2,y2,conf)
+        boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.25, iou=0.45, imgsz=640, min_area=2500)
+       
         detection_time = time.time() - detection_start
         self.timers['detection'].append(detection_time)
         print(f"⏱️  detection(all): {detection_time:.3f}s  候选数: {len(boxes) if boxes else 0}")
@@ -492,187 +459,7 @@ class RealtimeSegmentation3D:
         return best_mask, base_name
 
 
-
-    def detect_and_segment_and_dump(self, color_image):
-        """
-        本地完成检测->分割 返回用于显示的单通道uint8掩码（0/255）。
-        based on confidence score,只选择一条鱼进行分割，无检测时返回None。
-        """
-        # 检测（只选择一条鱼）
-        detection_start = time.time()
-        if getattr(self, 'use_yolo', False):
-            boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.25, iou=0.45, imgsz=640)
-        else:
-            boxes = self._detect_boxes(color_image)
-        detection_time = time.time() - detection_start
-        self.timers['detection'].append(detection_time)
-        print(f"⏱️  detection: {detection_time:.3f}s")
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        base_name = f"frame_{self.frame_count:06d}_{timestamp}"
-        
-        # 保存检测可视化（仅在debug模式下）
-        if self.debug:
-            det_vis = color_image.copy()
-            if len(boxes) > 0:
-                # 只标记选中的鱼（绿色框）
-                x1, y1, x2, y2, confidence = boxes[0]
-                cv2.rectangle(det_vis, (x1, y1), (x2, y2), (0, 255, 0), 3)  # 绿色粗框表示选中的鱼
-                cv2.putText(det_vis, f"SELECTED (conf: {confidence:.2f})", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                
-                # 保存选中的鱼的裁剪图像
-                crop = color_image[y1:y2, x1:x2]
-                if crop.size > 0:
-                    cv2.imwrite(os.path.join(self.detection_dir, f"{base_name}_selected_fish.png"), crop)
-                
-                cv2.imwrite(os.path.join(self.detection_dir, f"{base_name}_dino_detection.png"), det_vis)
-
-        if not boxes:
-            print("未检测到目标，跳过分割。")
-            return None, None
-
-        # 分割（SAM）- 只处理选中的一条鱼
-        segmentation_start = time.time()
-        try:
-            image_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
-            self.sam_predictor.set_image(image_rgb)
-            
-            # 只使用选中的边界框
-            x1, y1, x2, y2, confidence = boxes[0]
-            boxes_tensor = torch.tensor([[x1, y1, x2, y2]], device=self.device)
-            transformed_boxes = self.sam_predictor.transform.apply_boxes_torch(boxes_tensor, image_rgb.shape[:2])
-
-            # 使用multimask_output=False确保只返回一个掩码
-            masks, scores, logits = self.sam_predictor.predict_torch(
-                point_coords=None,
-                point_labels=None,
-                boxes=transformed_boxes,
-                multimask_output=False  # 只返回一个最佳掩码
-            )
-
-            # 处理选中的鱼的掩码 - 确保只使用第一个掩码
-            if masks.shape[0] > 0 and masks.shape[1] > 0:
-                # 只取第一个掩码（索引[0][0]）
-                m_bool = masks[0][0].cpu().numpy().astype(np.uint8)
-                mask_np = m_bool * 255
-                
-                # 进一步限制掩码只在边界框区域内
-                # 创建一个全零掩码
-                restricted_mask = np.zeros_like(mask_np)
-                # 只在边界框区域内应用掩码
-                restricted_mask[y1:y2, x1:x2] = mask_np[y1:y2, x1:x2]
-                mask_np = restricted_mask
-                
-                # 保存掩码（仅在debug模式下）
-                if self.debug:
-                    mask_path = os.path.join(self.segmentation_dir, f"{base_name}_selected_fish_mask.png")
-                    cv2.imwrite(mask_path, mask_np)
-                    
-                    # 保存裁剪掩码
-                    mask_crop = mask_np[y1:y2, x1:x2]
-                    if mask_crop.size > 0:
-                        mask_crop_path = os.path.join(self.segmentation_dir, f"{base_name}_selected_fish_mask_crop.png")
-                        cv2.imwrite(mask_crop_path, mask_crop)
-                    
-                    # 保存裁剪可视化
-                    crop = color_image[y1:y2, x1:x2]
-                    if crop.size > 0 and mask_crop.size > 0:
-                        overlay = np.zeros_like(crop)
-                        overlay[mask_crop > 0] = [0, 255, 0]
-                        vis_crop = cv2.addWeighted(crop, 1.0, overlay, 0.4, 0)
-                        vis_crop_path = os.path.join(self.segmentation_dir, f"{base_name}_selected_fish_vis.png")
-                        cv2.imwrite(vis_crop_path, vis_crop)
-                    
-                    # 保存整体可视化
-                    colored = np.zeros_like(color_image)
-                    colored[mask_np > 0] = [0, 255, 0]
-                    vis = cv2.addWeighted(color_image, 1.0, colored, 0.4, 0)
-                    vis_path = os.path.join(self.segmentation_dir, f"{base_name}_selected_fish_overlay.png")
-                    cv2.imwrite(vis_path, vis)
-                
-                segmentation_time = time.time() - segmentation_start
-                self.timers['segmentation'].append(segmentation_time)
-                print(f"⏱️  segmentation: {segmentation_time:.3f}s")
-                
-                print(f"成功分割选中的鱼，掩码点数: {np.sum(mask_np > 0)}")
-                print(f"掩码限制在边界框内: ({x1}, {y1}) 到 ({x2}, {y2})")
-                return mask_np, base_name
-            else:
-                segmentation_time = time.time() - segmentation_start
-                self.timers['segmentation'].append(segmentation_time)
-                print(f"⏱️  segmentation: {segmentation_time:.3f}s")
-                print("分割失败，未生成掩码")
-                return None, None
-                
-        except Exception as e:
-            segmentation_time = time.time() - segmentation_start
-            self.timers['segmentation'].append(segmentation_time)
-            print(f"⏱️  segmentation: {segmentation_time:.3f}s")
-            print(f"分割时出错: {e}")
-            return None, None
-
-    def _detect_boxes(self, color_image):
-        """
-        使用与 seg.py 相同的方式进行检测，返回bbox列表
-        只选择一条鱼进行分割和抓取
-        """
-        # 转换为PIL图像（与 seg.py 一致）
-        image_pil = Image.fromarray(cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB))
-        text_prompt = "fish. crab. marine animal"
-        inputs = self.processor(images=image_pil, text=text_prompt, return_tensors="pt").to(self.device)
-        with torch.no_grad():
-            outputs = self.grounding_dino_model(**inputs)
-        h, w = color_image.shape[0], color_image.shape[1]
-        results = self.processor.post_process_grounded_object_detection(
-            outputs,
-            inputs.input_ids,
-            text_threshold=0.3,
-            # 与 seg.py 相同的尺寸传入方式
-            target_sizes=[image_pil.size[::-1]]
-        )
-        result = results[0]
-        boxes = []
-        print("\n检测结果详情:")
-        print(f"检测到的目标数量: {len(result['boxes'])}")
-        if len(result["boxes"]) == 0:
-            return boxes
-        
-        # 过滤边界框：面积必须大于1000像素
-        valid_boxes = []
-        for box in result["boxes"]:
-            x1, y1, x2, y2 = [int(c) for c in box.tolist()]
-            x1 = max(0, min(x1, w - 1))
-            y1 = max(0, min(y1, h - 1))
-            x2 = max(0, min(x2, w - 1))
-            y2 = max(0, min(y2, h - 1))
-            
-            # 计算边界框面积
-            area = (x2 - x1) * (y2 - y1)
-            if area > 1000:  # 面积过滤
-                valid_boxes.append(((x1, y1, x2, y2), area))
-        
-        if valid_boxes:
-            # 根据选择策略选择边界框
-            if self.bbox_selection == "smallest":
-                selected_box = min(valid_boxes, key=lambda x: x[1])
-                selection_type = "面积最小的"
-            elif self.bbox_selection == "largest":
-                selected_box = max(valid_boxes, key=lambda x: x[1])
-                selection_type = "面积最大的"
-            else:
-                # 默认选择最小的
-                selected_box = min(valid_boxes, key=lambda x: x[1])
-                selection_type = "面积最小的"
-                print(f"警告: 未知的选择策略 '{self.bbox_selection}'，使用默认策略 'smallest'")
-            
-            boxes.append(selected_box[0])
-            print(f"检测到 {len(valid_boxes)} 条鱼，选择{selection_type}进行抓取，面积: {selected_box[1]} 像素")
-            print(f"选择的鱼位置: {selected_box[0]}")
-        else:
-            print("没有满足面积要求的边界框")
-        
-        return boxes
-
-    def detect_yolo(self, color_image, yolo_weights_path, conf=0.5, iou=0.45, imgsz=640, min_area=1000):
+    def detect_yolo(self, color_image, yolo_weights_path, conf=0.25, iou=0.45, imgsz=640, min_area=1000):
         """
         使用Ultralytics YOLO进行鱼的检测，返回所有检测到的bbox。
         
@@ -687,25 +474,19 @@ class RealtimeSegmentation3D:
         Returns:
             boxes: List[Tuple[x1, y1, x2, y2, confidence]] 所有满足条件的bbox；若无则返回空列表
         """
-        try:
-            from ultralytics import YOLO
-        except Exception as e:
-            print("[错误] 未找到 ultralytics，请先: pip install ultralytics")
-            print(e)
-            return []
-
-        # 加载模型（每次调用加载避免与其他依赖冲突；若频繁调用可外部缓存模型实例）
-        try:
-            model = YOLO(yolo_weights_path)
-        except Exception as e:
-            print(f"[错误] 加载YOLO权重失败: {yolo_weights_path} -> {e}")
-            return []
+     
 
         # YOLO支持直接传入numpy图像；确保为RGB
         #image_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
+        #import pdb; pdb.set_trace()
         try:
-            results = model.predict(
-                source=[color_image],
+            # grayscale only for detection if enabled
+            det_input = color_image
+            if getattr(self, 'det_gray', False):
+                gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
+                det_input = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+            results = self.yolo_model.predict(
+                source=[det_input],
                 imgsz=imgsz,
                 conf=conf,
                 iou=iou,
@@ -763,86 +544,7 @@ class RealtimeSegmentation3D:
 
         return boxes
     
-    def detect_yolo_all(self, color_image, yolo_weights_path, conf=0.5, iou=0.45, imgsz=640):
-        """
-        使用Ultralytics YOLO对单帧进行推理，返回所有检测到的bbox（不做面积过滤与单框选择）。
-        返回：List[Tuple[int,int,int,int,float,int]] -> (x1,y1,x2,y2,conf,cls)
-        """
-        try:
-            from ultralytics import YOLO
-        except Exception as e:
-            print("[错误] 未找到 ultralytics，请先: pip install ultralytics")
-            print(e)
-            return []
 
-        # 加载模型（简化为每次加载；如需优化可在外部缓存）
-        try:
-            model = YOLO(yolo_weights_path)
-        except Exception as e:
-            print(f"[错误] 加载YOLO权重失败: {yolo_weights_path} -> {e}")
-            return []
-
-        # BGR -> RGB
-        #image_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
-        try:
-            results = model.predict(
-                source=[color_image],
-                imgsz=imgsz,
-                conf=conf,
-                iou=iou,
-                device=(0 if self.device == 'cuda' else 'cpu'),
-                verbose=False,
-                save=False,
-            )
-        except Exception as e:
-            print(f"[错误] YOLO 推理失败: {e}")
-            return []
-
-        if not results:
-            print("[YOLO] 无检测结果")
-            return []
-
-        res = results[0]
-        if not hasattr(res, 'boxes') or res.boxes is None or res.boxes.shape[0] == 0:
-            print("[YOLO] boxes 为空")
-            return []
-
-        xyxy = res.boxes.xyxy.cpu().numpy()  # (N,4)
-        conf_arr = res.boxes.conf.cpu().numpy() if hasattr(res.boxes, 'conf') else None
-        cls_arr = res.boxes.cls.cpu().numpy() if hasattr(res.boxes, 'cls') else None
-
-        all_boxes = []
-        for i, b in enumerate(xyxy):
-            x1, y1, x2, y2 = [int(round(v)) for v in b[:4].tolist()]
-            conf_v = float(conf_arr[i]) if conf_arr is not None else 0.0
-            cls_v = int(cls_arr[i]) if cls_arr is not None else -1
-            all_boxes.append((x1, y1, x2, y2, conf_v, cls_v))
-
-        print(f"[YOLO] 检测到 {len(all_boxes)} 个框（conf>={conf}）：前3个: {all_boxes[:3]}")
-        return all_boxes
-
-    def dump_detections(self, color_image):
-        """
-        将检测到的目标裁剪并保存到 detection/ 目录
-        """
-        boxes = self._detect_boxes(color_image)
-        if not boxes:
-            return 0
-        base_ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        saved = 0
-        for idx, (x1, y1, x2, y2) in enumerate(boxes):
-            crop = color_image[y1:y2, x1:x2]
-            if crop.size == 0:
-                continue
-            filename = f"frame_{self.frame_count:06d}_{base_ts}_det_{idx}.png"
-            path = os.path.join(self.detection_dir, filename)
-            cv2.imwrite(path, crop)
-            saved += 1
-        if saved:
-            print(f"已保存 {saved} 个检测裁剪到: {self.detection_dir}")
-        return saved
-
-    
     def generate_pointcloud(self, color_image, depth_image, mask):
         """
         从掩码生成3D点云
@@ -879,434 +581,59 @@ class RealtimeSegmentation3D:
             return np.array([]), np.array([])
 
     def apply_hand_eye_transform(self, points):
-        """
-        将点云从相机系转换到夹爪系，使用 self.hand_eye_transform (4x4)。
-        旋转矩阵：
-            [[-0.99462885  0.07149648  0.07484454]
-            [-0.06962775 -0.9971997   0.02728984]
-            [ 0.07658608  0.021932    0.99682173]]
-            平移向量：
-            [[ 0.0247092 ]
-            [ 0.09912939]
-            [-0.25357213]]
-        """
-        if self.hand_eye_transform is None or points.size == 0:
-            return points
-        ones = np.ones((points.shape[0], 1), dtype=np.float32)
-        homo = np.hstack([points.astype(np.float32), ones])  # (N,4)
-        transformed = (self.hand_eye_transform @ homo.T).T  # (N,4)
-        return transformed[:, :3]
+        """使用 util.apply_hand_eye_transform 应用手眼标定变换"""
+        return util_apply_hand_eye_transform(points, self.hand_eye_transform)
 
     def _rpy_to_rotation_matrix(self, rx, ry, rz):
-        """
-        将末端的 RPY (rx, ry, rz) 转为旋转矩阵 R (基座→末端)。
-        采用常见的外旋顺序 R = Rz @ Ry @ Rx。
-        """
-        sx, cx = np.sin(rx), np.cos(rx)
-        sy, cy = np.sin(ry), np.cos(ry)
-        sz, cz = np.sin(rz), np.cos(rz)
-
-        Rx = np.array([[1, 0, 0],
-                       [0, cx, -sx],
-                       [0, sx,  cx]], dtype=np.float32)
-        Ry = np.array([[ cy, 0, sy],
-                       [  0, 1,  0],
-                       [-sy, 0, cy]], dtype=np.float32)
-        Rz = np.array([[cz, -sz, 0],
-                       [sz,  cz, 0],
-                       [ 0,   0, 1]], dtype=np.float32)
-
-        return (Rz @ Ry @ Rx).astype(np.float32)
+        # 保留兼容方法但委托到 util（如后续直接调用 util，可删除此方法）
+        from util import rpy_to_rotation_matrix
+        return rpy_to_rotation_matrix(rx, ry, rz)
 
     def _tool_offset_to_base(self, delta_tool_xyz_mm, tcp_rpy):
-        """
-        将夹爪(工具)坐标系下的位移(mm)转换到基坐标系下的位移(mm)。
-        delta_tool_xyz_mm: [dx, dy, dz] in tool frame
-        tcp_rpy: [rx, ry, rz] in radians
-        返回: [dx_base, dy_base, dz_base]
-        """
-        rx, ry, rz = tcp_rpy
-        R_base_tool = self._rpy_to_rotation_matrix(rx, ry, rz)
-        delta_tool = np.asarray(delta_tool_xyz_mm, dtype=np.float32).reshape(3, 1)
-        delta_base = (R_base_tool @ delta_tool).reshape(3)
-        return delta_base.tolist()
+        # 保留兼容方法但委托到 util
+        dx, dy, dz = util_tool_offset_to_base(delta_tool_xyz_mm, tcp_rpy)
+        return [dx, dy, dz]
 
     def calculate_pointcloud_bbox(self, points):
-        """
-        计算点云的边界框信息，用于高度和姿态估计
-        
-        Args:
-            points: 点云坐标 (N, 3)
-            
-        Returns:
-            bbox_info: 字典包含中心点、尺寸、边界框等
-        """
-        if points.size == 0:
-            return None
-            
-        # 计算边界框
-        min_coords = np.min(points, axis=0)  # [min_x, min_y, min_z]
-        max_coords = np.max(points, axis=0)  # [max_x, max_y, max_z]
-        
-        # 计算中心点
-        center = (min_coords + max_coords) / 2.0  # [center_x, center_y, center_z]
-        
-        # 计算尺寸
-        dimensions = max_coords - min_coords  # [width, height, depth]
-        
-        # 计算高度（z方向）
-        height = dimensions[2]  # z方向的高度
-        
-        # 计算8个角点
-        corners = []
-        for x in [min_coords[0], max_coords[0]]:
-            for y in [min_coords[1], max_coords[1]]:
-                for z in [min_coords[2], max_coords[2]]:
-                    corners.append([x, y, z])
-        corners = np.array(corners)
-        
-        # 计算点云的主方向（PCA）
-        try:
-            from sklearn.decomposition import PCA
-            pca = PCA(n_components=3)
-            pca.fit(points)
-            principal_axes = pca.components_  # 主方向向量
-            explained_variance = pca.explained_variance_ratio_  # 解释方差比例
-        except ImportError:
-            print("sklearn未安装，跳过PCA姿态估计")
-            principal_axes = np.eye(3)
-            explained_variance = [1.0, 0.0, 0.0]
-        
-        bbox_info = {
-            'center': center,
-            'dimensions': dimensions,
-            'height': height,
-            'min_coords': min_coords,
-            'max_coords': max_coords,
-            'corners': corners,
-            'principal_axes': principal_axes,
-            'explained_variance': explained_variance,
-            'num_points': len(points)
-        }
-        
-        return bbox_info
+        from point_cloud_utils import calculate_pointcloud_bbox
+        return calculate_pointcloud_bbox(points)
 
     def calculate_surface_normal(self, points, method='pca'):
-        """
-        计算点云质心处的表面法向量
-        
-        Args:
-            points: 点云坐标 (N, 3)
-            method: 法向量计算方法 ('pca', 'plane_fitting', 'nearest_neighbors')
-            
-        Returns:
-            normal: 法向量 (3,) 单位向量
-            centroid: 质心坐标 (3,)
-        """
-        if points.size == 0 or len(points) < 3:
-            return np.array([0, 0, 1]), np.array([0, 0, 0])
-        
-        centroid = np.mean(points, axis=0)
-        
-        if method == 'pca':
-            # 使用PCA计算法向量
-            try:
-                from sklearn.decomposition import PCA
-                pca = PCA(n_components=3)
-                pca.fit(points)
-                # 最小特征值对应的特征向量就是法向量
-                normal = pca.components_[2]  # 第三个主成分（最小方差方向）
-            except ImportError:
-                print("sklearn未安装，使用简单平面拟合")
-                return self._simple_plane_fitting(points, centroid)
-        
-        elif method == 'plane_fitting':
-            return self._simple_plane_fitting(points, centroid)
-        
-        elif method == 'nearest_neighbors':
-            return self._nearest_neighbors_normal(points, centroid)
-        
-        else:
-            raise ValueError(f"未知的法向量计算方法: {method}")
-        
-        # 确保法向量指向正确的方向（通常指向相机方向）
-        # 如果法向量的z分量为负，则翻转方向
-        if normal[2] < 0:
-            normal = -normal
-        
-        # 归一化
-        normal = normal / np.linalg.norm(normal)
-        
-        return normal, centroid
+        from point_cloud_utils import calculate_surface_normal
+        return calculate_surface_normal(points, method)
 
     def _simple_plane_fitting(self, points, centroid):
-        """
-        使用简单平面拟合计算法向量
-        """
-        # 将点云中心化
-        centered_points = points - centroid
-        
-        # 构建协方差矩阵
-        cov_matrix = np.cov(centered_points.T)
-        
-        # 计算特征值和特征向量
-        eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
-        
-        # 最小特征值对应的特征向量就是法向量
-        normal = eigenvectors[:, 0]  # 最小特征值对应的特征向量
-        
-        # 确保法向量指向正确的方向
-        if normal[2] < 0:
-            normal = -normal
-        
-        # 归一化
-        normal = normal / np.linalg.norm(normal)
-        
-        return normal, centroid
+        from point_cloud_utils import _simple_plane_fitting
+        return _simple_plane_fitting(points, centroid)
 
     def _nearest_neighbors_normal(self, points, centroid, k=20):
-        """
-        使用最近邻方法计算法向量
-        """
-        # 计算每个点到质心的距离
-        distances = np.linalg.norm(points - centroid, axis=1)
-        
-        # 找到最近的k个点
-        nearest_indices = np.argsort(distances)[:k]
-        nearest_points = points[nearest_indices]
-        
-        # 使用这些最近邻点进行平面拟合
-        return self._simple_plane_fitting(nearest_points, centroid)
+        from point_cloud_utils import _nearest_neighbors_normal
+        return _nearest_neighbors_normal(points, centroid, k)
 
     def normal_to_rpy(self, normal_vector, current_rpy=None):
-        """
-        将法向量转换为机器人末端姿态的RPY角度
-        
-        Args:
-            normal_vector: 法向量 (3,) 单位向量，表示期望的Z轴方向
-            current_rpy: 当前RPY角度 [rx, ry, rz] (可选，用于平滑过渡)
-            
-        Returns:
-            target_rpy: 目标RPY角度 [rx, ry, rz]
-        """
-        # 期望的Z轴方向（法向量）
-        z_target = normal_vector / np.linalg.norm(normal_vector)
-        
-        # 定义参考坐标系（可以根据需要调整）
-        # 这里假设X轴指向机器人前方，Y轴指向机器人左侧
-        x_ref = np.array([1, 0, 0])  # 参考X轴
-        y_ref = np.array([0, 1, 0])  # 参考Y轴
-        
-        # 计算新的坐标系
-        # Z轴 = 法向量
-        z_new = z_target
-        
-        # X轴 = 参考X轴在垂直于Z轴的平面上的投影
-        x_new = x_ref - np.dot(x_ref, z_new) * z_new
-        x_new = x_new / np.linalg.norm(x_new)
-        
-        # Y轴 = Z轴 × X轴
-        y_new = np.cross(z_new, x_new)
-        y_new = y_new / np.linalg.norm(y_new)
-        
-        # 构建旋转矩阵
-        R = np.column_stack([x_new, y_new, z_new])
-        
-        # 将旋转矩阵转换为RPY角度
-        # 使用ZYX欧拉角顺序（Roll-Pitch-Yaw）
-        sy = np.sqrt(R[0, 0] * R[0, 0] + R[1, 0] * R[1, 0])
-        
-        singular = sy < 1e-6
-        
-        if not singular:
-            rx = np.arctan2(R[2, 1], R[2, 2])  # Roll
-            ry = np.arctan2(-R[2, 0], sy)      # Pitch
-            rz = np.arctan2(R[1, 0], R[0, 0])  # Yaw
-        else:
-            rx = np.arctan2(-R[1, 2], R[1, 1])  # Roll
-            ry = np.arctan2(-R[2, 0], sy)       # Pitch
-            rz = 0                               # Yaw
-        
-        target_rpy = np.array([rx, ry, rz])
-        
-        # 如果提供了当前RPY，进行平滑过渡
-        if current_rpy is not None:
-            target_rpy = self._smooth_rpy_transition(current_rpy, target_rpy)
-        
-        return target_rpy
+        from pose import normal_to_rpy as pose_normal_to_rpy
+        return pose_normal_to_rpy(normal_vector, current_rpy)
 
     def _smooth_rpy_transition(self, current_rpy, target_rpy, max_change=0.1):
-        """
-        平滑RPY角度过渡，避免突变
-        
-        Args:
-            current_rpy: 当前RPY角度
-            target_rpy: 目标RPY角度
-            max_change: 单次最大变化量（弧度）
-            
-        Returns:
-            smoothed_rpy: 平滑后的RPY角度
-        """
-        current_rpy = np.array(current_rpy)
-        target_rpy = np.array(target_rpy)
-        
-        # 计算角度差
-        diff = target_rpy - current_rpy
-        
-        # 处理角度跳跃（±π）
-        for i in range(3):
-            if diff[i] > np.pi:
-                diff[i] -= 2 * np.pi
-            elif diff[i] < -np.pi:
-                diff[i] += 2 * np.pi
-        
-        # 限制变化量
-        for i in range(3):
-            if abs(diff[i]) > max_change:
-                diff[i] = np.sign(diff[i]) * max_change
-        
-        # 计算平滑后的角度
-        smoothed_rpy = current_rpy + diff
-        
-        return smoothed_rpy
+        from pose import smooth_rpy_transition
+        return smooth_rpy_transition(current_rpy, target_rpy, max_change)
 
     def estimate_fish_weight(self, points_gripper, volume_factor: float = 1.0) -> float:
-        """
-        根据点云估算鱼的重量
-        
-        Args:
-            points_gripper: 夹爪坐标系中的点云 (N, 3)
-            volume_factor: 体积到重量的转换因子 (kg/m³)
-            
-        Returns:
-            weight_kg: 估算的鱼重量（千克）
-        """
-        if points_gripper.size == 0 or len(points_gripper) < 3:
-            return 0.0
-        
-        # 计算点云的边界框体积
-        min_coords = np.min(points_gripper, axis=0)
-        max_coords = np.max(points_gripper, axis=0)
-        dimensions = max_coords - min_coords
-        
-        # 计算体积（立方米）
-        volume_m3 = np.prod(dimensions)
-        
-        # 应用形状因子（鱼不是完美的矩形）
-        shape_factor = 0.6  # 经验值，鱼的实际体积约为边界框的60%
-        effective_volume = volume_m3 * shape_factor
-        
-        # 估算重量（假设鱼的密度约为1000 kg/m³）
-        fish_density = 1000.0  # kg/m³
-        weight_kg = effective_volume * fish_density * volume_factor
-        
-        # 限制在合理范围内
-        weight_kg = max(0.1, min(weight_kg, 2.0))  # 0.1kg 到 2.0kg
-        
-        return weight_kg
+        from util import estimate_fish_weight
+        return estimate_fish_weight(points_gripper, volume_factor)
 
     def calculate_grasp_pose_with_normal(self, points_gripper, current_tcp):
-        """
-        计算考虑法向量的抓取姿态
-        
-        Args:
-            points_gripper: 夹爪坐标系中的点云 (N, 3)
-            current_tcp: 当前TCP位置 [x, y, z, rx, ry, rz]
-            
-        Returns:
-            grasp_pose: 抓取姿态 [x, y, z, rx, ry, rz]
-            normal_info: 法向量信息字典
-        """
-        if points_gripper.size == 0 or len(points_gripper) < 3:
-            print("点云点数不足，无法计算法向量")
-            return current_tcp, None
-        
-        # 计算质心和法向量
-        normal, centroid = self.calculate_surface_normal(points_gripper, method='pca')
-        
-        print(f"质心坐标: {centroid}")
-        print(f"法向量: {normal}")
-        
-        # 将法向量转换为RPY角度
-        current_rpy = current_tcp[3:6]
-        target_rpy = self.normal_to_rpy(normal, current_rpy)
-        
-        print(f"当前RPY: {np.degrees(current_rpy)} 度")
-        print(f"目标RPY: {np.degrees(target_rpy)} 度")
-        
-
-        delta_tool_mm = [centroid[0] * 1000, centroid[1] * 1000, centroid[2] * 1000]
-        delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
-
-        # 构建抓取姿态
-        grasp_pose = np.array([
-            delta_base_xyz[0],  # 转换为毫米
-            delta_base_xyz[1],
-            delta_base_xyz[2] -25 , # move a bit deeper  to make sure the gripper is attached with the object
-            target_rpy[0],       # 保持弧度
-            target_rpy[1],
-            target_rpy[2]
-        ])
-        
-        # 法向量信息
-        normal_info = {
-            'centroid': centroid,
-            'normal': normal,
-            'current_rpy': current_rpy,
-            'target_rpy': target_rpy,
-            'rpy_change': target_rpy - current_rpy
-        }
-        
-        return grasp_pose, normal_info
+        from pose import calculate_grasp_pose_with_normal as pose_calculate_grasp_pose_with_normal
+        return pose_calculate_grasp_pose_with_normal(points_gripper, current_tcp)
     
-    def save_results(self, color_image, depth_image, mask, points, colors):
-        """
-        保存所有结果
-        
-        Args:
-            color_image: RGB图像
-            depth_image: 深度图像
-            mask: 分割掩码
-            points: 3D点坐标
-            colors: RGB颜色
-        """
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        base_name = f"frame_{self.frame_count:06d}_{timestamp}"
-        
-        # 保存RGB图像
-        rgb_path = os.path.join(self.rgb_dir, f"{base_name}.png")
-        cv2.imwrite(rgb_path, color_image)
-        
-        # 保存深度图像
-        depth_path = os.path.join(self.depth_dir, f"{base_name}.png")
-        cv2.imwrite(depth_path, depth_image.astype(np.uint16))
-        
-        # 保存掩码
-        if mask is not None:
-            mask_path = os.path.join(self.mask_dir, f"{base_name}_mask.png")
-            cv2.imwrite(mask_path, mask.astype(np.uint8) * 255)
-            
-            # 创建可视化结果
-            colored_mask = np.zeros_like(color_image)
-            colored_mask[mask] = [0, 255, 0]  # 绿色掩码
-            alpha = 0.5
-            visualization = cv2.addWeighted(color_image, 1, colored_mask, alpha, 0)
-            vis_path = os.path.join(self.segmentation_dir, f"{base_name}_vis.png")
-            cv2.imwrite(vis_path, visualization)
-        
-        # 保存点云
-        if self.save_pointcloud and len(points) > 0:
-            pointcloud_path = os.path.join(self.pointcloud_dir, f"{base_name}_pointcloud.ply")
-            save_pointcloud_to_file(points, colors, pointcloud_path)
-        
-        print(f"已保存第 {self.frame_count} 帧结果")
     
     def show_preview(self, color_image, depth_image, mask, detection_vis=None, landmark_vis=None):
         """
         在一个窗口中显示2x2网格：RGB、检测、分割和关键点预测结果
         """
+ 
         # 调整图像大小
-        display_size = (600, 450)
+        display_size = (640, 480)
         
         # 1. RGB图像
         rgb_display = cv2.resize(color_image, display_size)
@@ -1381,7 +708,20 @@ class RealtimeSegmentation3D:
             print("按 'p' 键显示放置状态")
             print("按 'v' 键显示放置可视化")
         
+        # 验证相机连接
+        if not self.validate_camera_connection():
+            print("❌ 相机连接验证失败，请检查相机连接后重试")
+            return
 
+
+        ret = self.robot.joint_move([-193.484*np.pi/180,
+                        98.108*np.pi/180, 
+                        -64.836*np.pi/180, 
+                        56.796*np.pi/180,
+                        -270.49*np.pi/180, 
+                        168.094*np.pi/180], 0, True, 1)
+
+        time.sleep(1)
         tcp_result = self.robot.get_tcp_position()
         if isinstance(tcp_result, tuple) and len(tcp_result) == 2:
             tcp_ok, original_tcp = tcp_result
@@ -1390,18 +730,21 @@ class RealtimeSegmentation3D:
             original_tcp = tcp_result
             tcp_ok = True
 
+        fish_count = 0 # count the number of fish in the container
+        fish_path_json = json.load(open('configs/fish_paths.json'))
         try:
             while True:
                 # 整个循环计时开始
                 cycle_start = time.time()
                 
-                # 捕获帧
-                color_image, depth_image, success = self.capture_frames()
+                # 捕获帧（使用重试机制）
+                color_image, depth_image, success = self.capture_frames() #self.capture_frames_with_retry(max_retries=3, timeout_ms=10000)
                 if not success:
+                    print("⚠️  跳过此帧，继续处理下一帧...")
                     continue
                 
                 self.frame_count = self.frame_count + 1
-               
+                        # 这里可以添加重新连接逻辑
                 if self.frame_count < 10 :
                     print(f"跳过前10帧，等待相机稳定...")
                     continue
@@ -1434,10 +777,9 @@ class RealtimeSegmentation3D:
                 detection_vis = None
                 if mask_vis is not None:
                     # 重新运行检测以获取边界框可视化
-                    if getattr(self, 'use_yolo', False):
-                        boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.25, iou=0.45, imgsz=640)
-                    else:
-                        boxes = self._detect_boxes(color_image)
+                    #if getattr(self, 'use_yolo', False):
+                    boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.15, iou=0.45, imgsz=640)
+                  
                     
                     if boxes:
                         detection_vis = color_image.copy()
@@ -1453,7 +795,7 @@ class RealtimeSegmentation3D:
                                     cv2.putText(detection_vis, f"{confidence:.2f}", (x1, y1-10), 
                                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 
-                # 生成关键点预测可视化
+                # 生成关键点/方向可视化
                 landmark_vis = None
                 if (self.grasp_point_mode == "ai" and self.landmark_detector is not None and 
                     mask_vis is not None):
@@ -1481,6 +823,13 @@ class RealtimeSegmentation3D:
                             cv2.rectangle(landmark_vis, (x1, y1), (x2, y2), (255, 0, 0), 2)
                     except Exception as e:
                         print(f"[可视化] 关键点预测可视化失败: {e}")
+
+                # 若未生成关键点可视化，则可视化主方向（PCA）
+                if landmark_vis is None and mask_vis is not None:
+                    try:
+                        landmark_vis = draw_principal_axis(color_image, mask_vis > 0)
+                    except Exception:
+                        landmark_vis = None
                 
                 # 显示预览窗口
                 self.show_preview(color_image, depth_image, mask_vis, detection_vis, landmark_vis)
@@ -1562,6 +911,14 @@ class RealtimeSegmentation3D:
                     # 计算抓取点（优先AI）
                     relative_move = None
                     angle_rad = 0
+                    alpha_1 = None  # angle between head→body (image) and vertical (image y-axis)
+                    # 先用掩码基于PCA估计一个 alpha_1 作为默认值
+                    try:
+                        if mask_vis is not None:
+                            alpha_1 = estimate_body_angle_alpha1(mask_vis > 0)
+                            print(f"[PCA] 估计 alpha_1(rad) = {alpha_1:.4f}, deg = {np.degrees(alpha_1):.2f}")
+                    except Exception as e:
+                        print(f"[PCA] 估计 alpha_1 失败: {e}")
                     if self.grasp_point_mode == "ai" and self.landmark_detector is not None and mask_vis is not None:
                         try:
                             # 根据掩码计算外接矩形，得到鱼的裁剪区域
@@ -1612,18 +969,20 @@ class RealtimeSegmentation3D:
                                 body_grip_mm = point_grip_body * 1000.0
                                 head_grip_mm = point_grip_head * 1000.0
 
-                                # 方向向量（图像坐标系，单位向量）
-                                dir_img = np.array([u_head - u_body, v_head - v_body], dtype=np.float32)
+                                # 方向向量（图像坐标系，单位向量） head→body
+                                dir_img = np.array([u_body - u_head, v_body - v_head], dtype=np.float32)
                                 norm_img = np.linalg.norm(dir_img) + 1e-6
                                 dir_img_unit = (dir_img / norm_img).tolist()
+
+                                # 与图像竖直轴(即y轴)的夹角：使用 atan2(vx, vy)
+                                # 返回[-pi, pi] 的有符号角度
+                                alpha_1 = float(np.arctan2(dir_img[0], dir_img[1]))
 
                                 # 方向向量（夹爪坐标系XY，单位向量，mm）
                                 dir_grip_xy = np.array([head_grip_mm[0] - body_grip_mm[0], head_grip_mm[1] - body_grip_mm[1]], dtype=np.float32)
                                 norm_grip = np.linalg.norm(dir_grip_xy) + 1e-6
                                 dir_grip_xy_unit = (dir_grip_xy / norm_grip).tolist()
 
-
-            
                                 # 当前抓取按身体中心
                                 delta_tool_mm = [body_grip_mm[0], body_grip_mm[1], body_grip_mm[2]]
                                 delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
@@ -1631,7 +990,8 @@ class RealtimeSegmentation3D:
 
                                 print(f"🎯 使用AI身体中心: uv=({u_body:.1f},{v_body:.1f}) -> grip(mm)={body_grip_mm}")
                                 print(f"📍 头部中心: uv=({u_head:.1f},{v_head:.1f}) -> grip(mm)={head_grip_mm}")
-                                print(f"🧭 方向(像素xy,单位向量) body→head = {dir_img_unit}")
+                                print(f"🧭 方向(像素xy,单位向量) head→body = {dir_img_unit}")
+                                print(f"📐 与图像竖直轴的夹角 alpha_1(rad) = {alpha_1:.4f}, deg = {np.degrees(alpha_1):.2f}")
                                 print(f"🧭 方向(夹爪XY,单位向量) body→head = {dir_grip_xy_unit}")
                                 # 与X轴(1,0,0)的夹角（弧度），并规范化到 [-pi/2, pi/2]
                                 # 这样无论鱼体原始朝向如何，都会被映射到“朝向+X半平面”的等效姿态，便于统一放置方向
@@ -1641,7 +1001,6 @@ class RealtimeSegmentation3D:
                                 elif angle_rad < -np.pi/2:
                                     angle_rad += np.pi
                                 
-
                                 relative_move = [delta_base_xyz[0], delta_base_xyz[1], z_offset, 0, 0, 0]
 
                                 print(f"🧮 方向与X轴的夹角(rad): {angle_rad:.4f}")
@@ -1678,96 +1037,77 @@ class RealtimeSegmentation3D:
                     robot_movement_start = time.time()
                     
                     # 执行相对移动
-                    #import pdb; pdb.set_trace()
+                    #import pdb; pdb.set_trace()    
+                    fish_count += 1
+                    if fish_count > 6:
+                        print("容器已满，停止抓取")
+                        break
+                    
                     self.robot.set_digital_output(0, 0, 1)
 
                     ret = self.robot.linear_move(relative_move, 1, True, 500)
-                    # if ret != 0:
-                    #     print(f"机器人移动失败: {ret}")
-                    #     self.robot.linear_move(original_tcp, 0 , True, 400)
-                    #     self.robot.set_digital_output(0, 0, 0)
-                    #     continue
 
                     #  robot move up of 20 cm relatively 
                     #  ret = self.robot.linear_move([current_tcp[0], current_tcp[1], current_tcp[2] -100, current_tcp[3], current_tcp[4], current_tcp[5]], 0, True, 400)
-                    # if ret != 0:
-                    #     print(f"机器人移动失败: {ret}")
-                    #     self.robot.linear_move(original_tcp, 0 , True, 400)
-                    #     self.robot.set_digital_output(0, 0, 0)
-                    #     continue
-                    self.robot.linear_move(original_tcp, 0 , True, 500)
+                  
+                    
+                    self.robot.linear_move(original_tcp, 0 , True, 40)
 
                     print(f"旋转基座{angle_rad:.4f}弧度")
-                    ret = self.robot.joint_move([-np.pi  * 0.6, 0, 0, 0, 0, angle_rad -  np.pi * 0.6], 1, True, 1)
-                    ret = self.robot.linear_move([0, 0, -350, 0, 0, 0], 1 , True, 500)
-
-                    self.robot.set_digital_output(0, 0, 0)
-                    time.sleep(0.4)
-                    ret = self.robot.linear_move([0, 0, 350, 0, 0, 0], 1 , True, 500)
-                    ret = self.robot.joint_move([np.pi  * 0.6, 0, 0, 0, 0, 0], 1, True, 2)
-                    ret = self.robot.joint_move([0, 0, 0, 0, 0,  np.pi * 0.6 - angle_rad], 1, True, 2)
-                
-
-                    #time.sleep(0.01)
-                    #robot move back to the original position
-                    self.robot.linear_move(original_tcp, 0 , True, 500)
+                   
+                    #joint_pos=[(-108.292)*np.pi/180, (71.728)*np.pi/180,(-69.117)*np.pi/180, (85.922)*np.pi/180, (-269.575)*np.pi/180, (159.928)*np.pi/180]  
                     
-                    # 记录鱼到跟踪器
-                    if self.fish_tracker is not None and estimated_weight > 0:
-                        # 预测最终放置位置
-                        predicted_final_pose = None
-                        if self.position_solver is not None:
-                            # 估算鱼尺寸（基于点云边界框）
-                            if points_gripper is not None and len(points_gripper) > 0:
-                                min_coords = np.min(points_gripper, axis=0)
-                                max_coords = np.max(points_gripper, axis=0)
-                                fish_size_mm = (max_coords - min_coords) * 1000.0  # 转换为mm
-                                
-                                # 获取下一个鱼ID
-                                next_fish_id = self.fish_tracker.current_fish_id + 1
-                                
-                                # 预测放置位置
-                                placement = self.position_solver.find_optimal_position(
-                                    fish_id=next_fish_id,
-                                    fish_size_mm=fish_size_mm
-                                )
-                                
-                                if placement:
-                                    # 将容器坐标转换为机器人坐标系
-                                    # 假设容器在机器人工作空间中的位置
-                                    container_offset = [500.0, 0.0, 100.0]  # 容器在机器人坐标系中的偏移
-                                    predicted_final_pose = [
-                                        container_offset[0] + placement.x_mm,
-                                        container_offset[1] + placement.y_mm,
-                                        container_offset[2] + placement.z_mm,
-                                        0.0, 0.0, 0.0  # 末端姿态
-                                    ]
-                                    print(f"📍 预测放置位置: ({placement.x_mm:.1f}, {placement.y_mm:.1f}, {placement.z_mm:.1f})mm")
-                                else:
-                                    print("⚠️  无法找到合适的放置位置")
-                        
-                        # 添加鱼记录
-                        fish_id = self.fish_tracker.add_fish(
-                            weight_kg=estimated_weight,
-                            initial_pose=current_tcp,
-                            grasp_angle=angle_rad
-                        )
-                        
-                        # 更新鱼状态为已放置
-                        processing_time = time.time() - robot_movement_start
-                        self.fish_tracker.update_fish_status(
-                            fish_id=fish_id,
-                            status="placed",
-                            final_pose=predicted_final_pose,
-                            processing_time=processing_time
-                        )
-                        
-                        # 显示容器状态
-                        self.fish_tracker.print_status()
-                        
-                        # 显示位置求解器状态
-                        if self.position_solver is not None:
-                            self.position_solver.print_placement_status()
+                    xy_path = fish_path_json[str(fish_count)]
+                    joint_pos1 = [0, 0, 0, 0, 0, 0]
+                    joint_pos1[0] = xy_path[0][0]
+                    joint_pos1[1] = xy_path[0][1]
+                    joint_pos1[2] = 0
+                    joint_pos1[3] = 0
+                    joint_pos1[4] = 0
+                    joint_pos1[5] = 0
+
+                    ret = self.robot.linear_move(joint_pos1, 1, True, 400)
+                    joint_pos2 = [0, 0, 0, 0, 0, 0]
+                    joint_pos2[0] = xy_path[1][0]
+                    joint_pos2[1] = xy_path[1][1]
+                    joint_pos2[2] = -200
+                    joint_pos2[3] = 0
+                    joint_pos2[4] = 0
+                    joint_pos2[5] = 0
+
+
+                    target_xy = [xy_path[0][0] + xy_path[1][0], xy_path[0][1] + xy_path[1][1]]
+                    start_xy = [original_tcp[0], original_tcp[1]]
+
+                    start_vec = np.asarray(start_xy, dtype=np.float64)
+                    target_vec = np.asarray(target_xy, dtype=np.float64)
+                    distance_s_t = float(np.linalg.norm(target_vec - start_vec))
+
+                    # 计算从原点到 start/target 的夹角差
+                    alpha_2 = angle_between_2d_from_origin(start_vec, target_vec)
+                    # 若仍未得到 alpha_1，则置为 0
+                    if alpha_1 is None:
+                        alpha_1 = 0.0
+                    ret = self.robot.linear_move([start_xy[0], start_xy[1], 200, 0, 0, 0], 1 , True, 400)
+                    print("fish : {}".format(fish_count))
+                    print(joint_pos1)
+                    print(joint_pos2)
+                    ret = self.robot.linear_move(joint_pos2, 1, True, 400)
+
+                    offset_angle = np.pi / 2 - alpha_1 - alpha_2
+                    print(f"offset_angle: {offset_angle:.4f}")
+
+                    ret = self.robot.joint_move([0, 0, 0, 0, 0, offset_angle], 1, True, 2)
+                    self.robot.set_digital_output(0, 0, 0)
+                    time.sleep(0.1)
+                    ret = self.robot.linear_move([joint_pos2[0], joint_pos2[1], 200, 0, 0, 0], 1 , True, 400)
+                    #ret = self.robot.joint_move([-np.pi  * 0.3, 0, 0, 0, 0, 0], 1, True, 2)
+                    #ret = self.robot.joint_move([0, 0, 0, 0, 0,  np.pi * 0.3 - angle_rad], 1, True, 2)
+                    #robot move back to the original position
+                    self.robot.linear_move(original_tcp, 0 , True, 200)
+
+                    time.sleep(0.3)
+                    
                    
                     robot_movement_time = time.time() - robot_movement_start
                     self.timers['robot_movement'].append(robot_movement_time)
@@ -1834,6 +1174,8 @@ def main():
                       help='使用YOLO作为检测器（替代Grounding DINO）')
     parser.add_argument('--yolo_weights', type=str, default=None,
                       help='YOLO权重文件(.pt)路径（与 --use_yolo 搭配使用）')
+    parser.add_argument('--det_gray', action='store_true',
+                      help='仅在检测阶段使用灰度图像（SAM与抓取保持RGB）')
     parser.add_argument('--grasp_point_mode', type=str, default='centroid',
                       choices=['centroid', 'ai'],
                       help='抓取点模式: centroid(点云质心) 或 ai(使用AI身体中心)')
@@ -1861,9 +1203,9 @@ def main():
             grasp_point_mode=args.grasp_point_mode,
             landmark_model_path=args.landmark_model_path,
             enable_weight_tracking=args.enable_weight_tracking,
-            max_container_weight=args.max_container_weight
+            max_container_weight=args.max_container_weight,
+            det_gray=args.det_gray
         )
-        
         # 运行实时处理
         processor.run_realtime(
             max_frames=args.max_frames,

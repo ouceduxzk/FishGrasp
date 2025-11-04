@@ -54,32 +54,32 @@ def init_models(device="cpu"):
     sam.to(device=device)
     sam_predictor = SamPredictor(sam)
     
-    # 初始化Grounding DINO
-    print("正在加载Grounding DINO模型...")
-    model_id = "IDEA-Research/grounding-dino-tiny"
+    # # 初始化Grounding DINO
+    # print("正在加载Grounding DINO模型...")
+    # model_id = "IDEA-Research/grounding-dino-tiny"
     
-    # 检查本地模型缓存目录
-    import os
-    from huggingface_hub import snapshot_download
+    # # 检查本地模型缓存目录
+    # import os
+    # from huggingface_hub import snapshot_download
     
-    # 获取本地缓存路径
-    cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
-    model_cache_path = os.path.join(cache_dir, "models--" + model_id.replace("/", "--"))
+    # # 获取本地缓存路径
+    # cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
+    # model_cache_path = os.path.join(cache_dir, "models--" + model_id.replace("/", "--"))
     
-    if os.path.exists(model_cache_path):
-        print(f"发现本地模型缓存: {model_cache_path}")
-        print("从本地加载Grounding DINO模型...")
-        processor = AutoProcessor.from_pretrained(model_id, local_files_only=True)
-        model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id, local_files_only=True).to(device)
-    else:
-        print(f"本地未找到模型缓存，从网络下载: {model_id}")
-        print("正在下载Grounding DINO模型...")
-        processor = AutoProcessor.from_pretrained(model_id)
-        model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
+    # if os.path.exists(model_cache_path):
+    #     print(f"发现本地模型缓存: {model_cache_path}")
+    #     print("从本地加载Grounding DINO模型...")
+    #     processor = AutoProcessor.from_pretrained(model_id, local_files_only=True)
+    #     model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id, local_files_only=True).to(device)
+    # else:
+    #     print(f"本地未找到模型缓存，从网络下载: {model_id}")
+    #     print("正在下载Grounding DINO模型...")
+    #     processor = AutoProcessor.from_pretrained(model_id)
+    #     model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
     
-    print("Grounding DINO模型加载成功")
+    # print("Grounding DINO模型加载成功")
     
-    return sam_predictor, model, processor
+    return sam_predictor#, model, processor
 
 def process_image_for_mask(sam_predictor, grounding_dino_model, processor, image, device="cpu"):
     """

@@ -15,7 +15,7 @@ Ultralytics YOLO 训练脚本
     --batch 16 \
     --imgsz 640 \
     --project runs/train \
-    --name single_yolov8s_$(date +%Y%m%d_%H%M%S)
+    --name single_yolov8s_gray_$(date +%Y%m%d_%H%M%S)
 
 数据集YAML示例(data.yaml)：
   path: /abs/path/to/dataset
@@ -59,6 +59,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--aug", type=str, choices=["none", "light", "strong"], default="strong", help="数据增强强度")
     parser.add_argument("--box_gain", type=float, default=1.75, help="bbox损失增益(越大越严格)")
     parser.add_argument("--close_mosaic", type=int, default=10, help="训练末尾关闭mosaic的轮数")
+    # 新增：强制灰度图训练/验证
+    parser.add_argument("--grayscale", action="store_true", help="使用灰度图进行训练与验证（将图像转灰并三通道复用）")
     return parser.parse_args()
 
 
