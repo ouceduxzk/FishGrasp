@@ -51,63 +51,67 @@ ret = robot.joint_move([-193.484*np.pi/180,
 
 time.sleep(1)
 
+robot.set_digital_output(0, 0, 0)
+#time.sleep(10)
+#robot.set_digital_output(0, 0, 0)
+
 #ret = robot.linear_move([10, -220, -0, 0, 0, 0], 1, True, 100)
 #ret = robot.linear_move([0, -100, -50, 0, 0, 0], 1, True, 100)
 
 # Validate that required data is loaded
-if fish_paths is None:
-    print("Error: fish_paths not loaded. Cannot continue.")
-    robot.logout()
-    exit(1)
+#if fish_paths is None:
+#    print("Error: fish_paths not loaded. Cannot continue.")
+#    robot.logout()
+#    exit(1)
+#
+#if rows is None or cols is None or rows <= 0 or cols <= 0:
+#    print(f"Error: Invalid grid dimensions (rows={rows}, cols={cols}). Cannot continue.")
+#    robot.logout()
+#    exit(1)
+#
+#print(f"Starting to process {rows * cols} waypoints...")
+#
+#for n in range(rows * cols):
+#   account = n + 1
+#
+#   # get the first point
+#   xy_path = fish_paths[str(account)]
+#   joint_pos1 = [0, 0, 0, 0, 0, 0]
+#   joint_pos1[0] = xy_path[0][0]
+#   joint_pos1[1] = xy_path[0][1]
+#   joint_pos1[2] = 0
+#   joint_pos1[3] = 0
+#   joint_pos1[4] = 0
+#   joint_pos1[5] = 0
+#
+#   # move to the first point
+#   ret = robot.linear_move(joint_pos1, 1, True, 100)
+#
+#   # get the second point
+#   joint_pos2 = [0, 0, 0, 0, 0, 0]
+#   joint_pos2[0] = xy_path[1][0]
+#   joint_pos2[1] = xy_path[1][1]
+#   joint_pos2[2] = -200
+#   joint_pos2[3] = 0
+#   joint_pos2[4] = 0
+#   joint_pos2[5] = 0
+#
+#   #move to the second point
+#   ret = robot.linear_move(joint_pos2, 1, True, 100)
+#
+#   time.sleep(2)
+#
+#   ret = robot.linear_move([0,-joint_pos2[1],200,0,0,0], 1, True, 100)
+#
+#   ret = robot.joint_move([-193.484*np.pi/180,
+#                       98.108*np.pi/180, 
+#                       -64.836*np.pi/180, 
+#                       56.796*np.pi/180,
+#                       -270.49*np.pi/180, 
+#                       168.094*np.pi/180], 0, False, 1)
+#
+#   time.sleep(1)
+#
+#   print("times:",n)
 
-if rows is None or cols is None or rows <= 0 or cols <= 0:
-    print(f"Error: Invalid grid dimensions (rows={rows}, cols={cols}). Cannot continue.")
-    robot.logout()
-    exit(1)
-
-print(f"Starting to process {rows * cols} waypoints...")
-
-for n in range(rows * cols):
-   account = n + 1
-
-   # get the first point
-   xy_path = fish_paths[str(account)]
-   joint_pos1 = [0, 0, 0, 0, 0, 0]
-   joint_pos1[0] = xy_path[0][0]
-   joint_pos1[1] = xy_path[0][1]
-   joint_pos1[2] = 0
-   joint_pos1[3] = 0
-   joint_pos1[4] = 0
-   joint_pos1[5] = 0
-
-   # move to the first point
-   ret = robot.linear_move(joint_pos1, 1, True, 100)
-
-   # get the second point
-   joint_pos2 = [0, 0, 0, 0, 0, 0]
-   joint_pos2[0] = xy_path[1][0]
-   joint_pos2[1] = xy_path[1][1]
-   joint_pos2[2] = -200
-   joint_pos2[3] = 0
-   joint_pos2[4] = 0
-   joint_pos2[5] = 0
-
-   #move to the second point
-   ret = robot.linear_move(joint_pos2, 1, True, 100)
-
-   time.sleep(2)
-
-   ret = robot.linear_move([0,-joint_pos2[1],200,0,0,0], 1, True, 100)
-
-   ret = robot.joint_move([-193.484*np.pi/180,
-                       98.108*np.pi/180, 
-                       -64.836*np.pi/180, 
-                       56.796*np.pi/180,
-                       -270.49*np.pi/180, 
-                       168.094*np.pi/180], 0, False, 1)
-
-   time.sleep(1)
-
-   print("times:",n)
-
-robot.logout()
+#robot.logout()

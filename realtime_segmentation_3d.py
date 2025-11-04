@@ -434,7 +434,7 @@ class RealtimeSegmentation3D:
                 print(f"[分割] 候选框 {i} 掩码为空，跳过")
                 continue
 
-            points, colors = self.generate_pointcloud(color_image, depth_image, mask_bool)
+            points, colors = self.generate_pointcloud(color_image, depth_image, mask_bool)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          
             if points is None or len(points) == 0:
                 print(f"[点云] 候选框 {i} 点云为空，跳过")
                 continue
@@ -775,7 +775,8 @@ class RealtimeSegmentation3D:
             tcp_ok = True
 
         fish_count = 0 # count the number of fish in the container
-        
+        rows = -1
+        cols = -1
         # Load fish paths path from fish_grid_params.json
         fish_paths_path = getattr(self, 'fish_paths_file', None)
         if fish_paths_path is None:
@@ -1164,10 +1165,12 @@ class RealtimeSegmentation3D:
 
                     # rotate joint6 make sure the fish is vertical
                     ret = self.robot.joint_move([0, 0, 0, 0, 0, offset_angle], 1, True, 2)
-                    self.robot.set_digital_output(0, 0, 0)
+                    self.robot.set_digital_output(0, 1, 1)
                     time.sleep(0.1)
                     ret = self.robot.linear_move([-joint_pos2[0], -joint_pos2[1], 200, 0, 0, 0], 1 , True, 400)
                     self.robot.linear_move(original_tcp, 0 , True, 200)
+                    self.robot.set_digital_output(0,0,0)
+                    self.robot.set_digital_output(0,1,0)
 
                     time.sleep(0.3)
                     
