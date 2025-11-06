@@ -1045,7 +1045,8 @@ class RealtimeSegmentation3D:
                     
                     self.robot.set_digital_output(0, 0, 1)
 
-                    ret = self.robot.linear_move(relative_move, 1, True, 500)
+                    ret = self.robot.linear_move([relative_move[0],relative_move[1],0,0,0,0], 1, True, 500)
+                    ret = self.robot.linear_move([0,0,relative_move[2],0,0,0], 1, True, 100)
 
                     #  robot move up of 20 cm relatively 
                     #  ret = self.robot.linear_move([current_tcp[0], current_tcp[1], current_tcp[2] -100, current_tcp[3], current_tcp[4], current_tcp[5]], 0, True, 400)
