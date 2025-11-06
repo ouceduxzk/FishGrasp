@@ -346,7 +346,7 @@ class RealtimeSegmentation3D:
         detection_start = time.time()
         #if getattr(self, 'use_yolo', False):
         # YOLO 路径：detect_yolo 已返回所有满足条件的框 (x1,y1,x2,y2,conf)
-        boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.25, iou=0.45, imgsz=640, min_area=2500)
+        boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.5, iou=0.45, imgsz=640, min_area=2500)
        
         detection_time = time.time() - detection_start
         self.timers['detection'].append(detection_time)
@@ -854,7 +854,7 @@ class RealtimeSegmentation3D:
                 if mask_vis is not None:
                     # 重新运行检测以获取边界框可视化
                     #if getattr(self, 'use_yolo', False):
-                    boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.15, iou=0.45, imgsz=640)
+                    boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.5, iou=0.45, imgsz=640)
                   
                     if boxes:
                         detection_vis = color_image.copy()
@@ -984,6 +984,7 @@ class RealtimeSegmentation3D:
                             print(f"[PCA] 估计 alpha_1(rad) = {alpha_1:.4f}, deg = {np.degrees(alpha_1):.2f}")
                     except Exception as e:
                         print(f"[PCA] 估计 alpha_1 失败: {e}")
+
                     if self.grasp_point_mode == "ai" and self.landmark_detector is not None and mask_vis is not None:
                         try:
                             # 根据掩码计算外接矩形，得到鱼的裁剪区域
@@ -1082,7 +1083,7 @@ class RealtimeSegmentation3D:
                         center_gripper_mm = centroid * 1000
                         delta_tool_mm = [center_gripper_mm[0], center_gripper_mm[1], center_gripper_mm[2]]
                         delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
-                        z_offset = -delta_tool_mm[2] -25
+                        z_offset = -delta_tool_mm[2] -30
                         relative_move = [delta_base_xyz[0], delta_base_xyz[1], z_offset, 0, 0, 0]
                     
                     grasp_calc_time = time.time() - grasp_calc_start
@@ -1100,6 +1101,15 @@ class RealtimeSegmentation3D:
                     
                     # 机器人移动计时
                     robot_movement_start = time.time()
+                    delta_rad = float(alpha_1)
+                    delta_rad = ((delta_rad + np.pi) % (2 * np.pi)) - np.pi
+                    delta_rad = abs(delta_rad)
+                    if delta_rad > np.pi / 2:
+                        delta_rad = np.pi - delta_rad
+                    delta_rad = np.clip(delta_rad, 0.0, np.pi / 2)
+                    print(f"delta_rad: {delta_rad:.4f}")
+                    self.robot.joint_move([0,0,0,0,0,np.pi/2-alpha_1], 1, True, 1)
+                    time.sleep(0.5)
                     
                     # 执行相对移动
                     fish_count += 1
@@ -1114,7 +1124,8 @@ class RealtimeSegmentation3D:
                     self.robot.set_digital_output(0, 0, 1)
 
                     # catch fish
-                    ret = self.robot.linear_move(relative_move, 1, True, 500)
+                    ret = self.robot.linear_move([relative_move[0], relative_move[1], 0, 0, 0, 0], 1, True, 100)
+                    ret = self.robot.linear_move([0, 0, relative_move[2], 0, 0, 0], 1, True, 100)
                   
                     # go back to original point
                     self.robot.linear_move(original_tcp, 0 , True, 40)
@@ -1143,34 +1154,15 @@ class RealtimeSegmentation3D:
                     joint_pos2[4] = 0
                     joint_pos2[5] = 0
                     ret = self.robot.linear_move(joint_pos2, 1, True, 400)
-
-                    target_xy = [xy_path[0][0] + xy_path[1][0], xy_path[0][1] + xy_path[1][1]]
-                    start_xy = [original_tcp[0], original_tcp[1]]
-
-                    start_vec = np.asarray(start_xy, dtype=np.float64)
-                    target_vec = np.asarray(target_xy, dtype=np.float64)
-                    distance_s_t = float(np.linalg.norm(target_vec - start_vec))
-
-                    # 计算从原点到 start/target 的夹角差
-                    alpha_2 = angle_between_2d_from_origin(start_vec, target_vec)
-                    # 若仍未得到 alpha_1，则置为 0
-                    if alpha_1 is None:
-                        alpha_1 = 0.0
-                   
-                    offset_angle = np.pi / 2 - alpha_1 - alpha_2
-                    print(f"offset_angle: {offset_angle:.4f}")
-
-                    # rotate joint6 make sure the fish is vertical
-                    ret = self.robot.joint_move([0, 0, 0, 0, 0, offset_angle], 1, True, 2)
                     self.robot.set_digital_output(0, 1, 1)
                     time.sleep(0.2)
-                    ret = self.robot.joint_move([0, 0, 0, 0, 0, -offset_angle], 1, True, 2)
-                    ret = self.robot.linear_move([0, -joint_pos2[1], 200, 0, 0, 0], 1 , True, 400)
-                    self.robot.linear_move(original_tcp, 0 , True, 200)
                     self.robot.set_digital_output(0,0,0)
                     self.robot.set_digital_output(0,1,0)
-
-                    time.sleep(0.3)
+                    ret = self.robot.linear_move([0, -joint_pos2[1], 200, 0, 0, 0], 1 , True, 400)
+                    
+                    self.robot.linear_move(original_tcp, 0 , True, 200)
+                    
+                    time.sleep(1)
                     
                     robot_movement_time = time.time() - robot_movement_start
                     self.timers['robot_movement'].append(robot_movement_time)
