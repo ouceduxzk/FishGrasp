@@ -108,11 +108,21 @@ def find_image_for_json(jpath: Path, image_path_in_json: Optional[str], source_r
 
 
 def convert_one(json_path: Path, labels_root: Path, images_root: Optional[Path], copy_images: bool, split: str, class_order: List[str], seen_classes: Dict[str,int]) -> Optional[str]:
-    try:
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        return f"[跳过] 读取失败 {json_path}: {e}"
+    # 尝试多种编码读取JSON文件
+    encodings = ["utf-8", "gbk", "gb2312", "latin-1", "iso-8859-1"]
+    data = None
+    for enc in encodings:
+        try:
+            with open(json_path, "r", encoding=enc) as f:
+                data = json.load(f)
+                break
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        except Exception:
+            continue
+    
+    if data is None:
+        return f"[跳过] 读取失败 {json_path}: 无法使用任何编码读取"
 
     imgW = int(data.get("imageWidth", 0) or 0)
     imgH = int(data.get("imageHeight", 0) or 0)

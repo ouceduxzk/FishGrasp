@@ -9,13 +9,13 @@ Ultralytics YOLO 训练脚本
 
 示例：
   python3 detection/train_yolo.py \
-    --data ./datasets/l0_9.12/dataset.yaml \
+    --data ./datasets/l0_11.05_yolo/dataset.yaml \
     --model yolov8s.pt \
-    --epochs 100 \
-    --batch 16 \
+    --epochs 400 \
+    --batch 30 \
     --imgsz 640 \
     --project runs/train \
-    --name single_yolov8s_gray_$(date +%Y%m%d_%H%M%S)
+    --name single_yolov8s_$(date +%Y%m%d_%H%M%S)
 
 数据集YAML示例(data.yaml)：
   path: /abs/path/to/dataset

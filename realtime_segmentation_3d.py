@@ -24,17 +24,15 @@ import argparse
 import os
 import sys
 import time
-import math
 import numpy as np
 import cv2
 import torch
 from datetime import datetime
-from tqdm import tqdm
 from PIL import Image
 import json
 
 # 导入现有模块的功能
-from seg import init_models# process_image_cv2
+from seg import init_models
 from util import (
     estimate_body_angle_alpha1,
     draw_principal_axis,
@@ -45,7 +43,6 @@ from util import (
 from mask_to_3d import mask_to_3d_pointcloud, save_pointcloud, load_camera_intrinsics
 from realsense_capture import (
     setup_realsense,
-    depth_to_pointcloud,
     save_pointcloud_to_file,
     capture_frames as rs_capture_frames,
     capture_frames_with_retry as rs_capture_frames_with_retry,
@@ -82,18 +79,11 @@ except ImportError:
     print("[警告] 无法导入 FishContainerTracker，将跳过重量跟踪功能")
     FishContainerTracker = None
 
-# 导入位置求解器
-try:
-    from PositionSolver import PositionSolver, ContainerConfig
-except ImportError:
-    print("[警告] 无法导入 PositionSolver，将跳过位置预测功能")
-    PositionSolver = None
-    ContainerConfig = None
 
 class RealtimeSegmentation3D:
     def __init__(self, output_dir, device="cpu", save_pointcloud=True, intrinsics_file=None, hand_eye_file=None, bbox_selection="highest_confidence", debug=False, use_yolo=False, yolo_weights=None,
                  grasp_point_mode: str = "centroid", landmark_model_path: str = None, enable_weight_tracking: bool = True, max_container_weight: float = 12.5, det_gray: bool = False,
-                 fish_paths_file: str = "configs/fish_paths.json", camera_calib_json: str = None, robot_config: str = "config/robot.json"):
+                 camera_calib_json: str = None, robot_config: str = "config/robot.json"):
         """
         初始化实时分割和3D点云生成器
         
@@ -128,7 +118,6 @@ class RealtimeSegmentation3D:
         self.enable_weight_tracking = enable_weight_tracking
         self.max_container_weight = max_container_weight
         # configs
-        self.fish_paths_file = fish_paths_file
         self.camera_calib_json = camera_calib_json
         self.robot_config = robot_config
         # 创建输出目录（仅在debug模式下创建）
@@ -287,28 +276,6 @@ class RealtimeSegmentation3D:
                 self.fish_tracker = None
         else:
             print("鱼容器跟踪器未启用")
-
-        # 初始化位置求解器（可选）
-        self.position_solver = None
-        if self.enable_weight_tracking and PositionSolver is not None:
-            try:
-                # 配置容器参数（根据实际容器尺寸调整）
-                container_config = ContainerConfig(
-                    width_mm=300.0,      # 容器宽度
-                    height_mm=200.0,     # 容器高度
-                    depth_mm=150.0,      # 容器深度
-                    grid_spacing_mm=30.0, # 网格间距
-                    margin_mm=20.0,      # 边距
-                    base_height_mm=0.0   # 基础高度
-                )
-                self.position_solver = PositionSolver(container_config)
-                print("已启用位置求解器")
-            except Exception as e:
-                print(f"[警告] 位置求解器初始化失败: {e}")
-                self.position_solver = None
-        else:
-            print("位置求解器未启用")
-
 
         import jkrc 
         self.robot = jkrc.RC("192.168.80.116")
@@ -499,8 +466,6 @@ class RealtimeSegmentation3D:
      
 
         # YOLO支持直接传入numpy图像；确保为RGB
-        #image_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
-        #import pdb; pdb.set_trace()
         try:
             # grayscale only for detection if enabled
             det_input = color_image
@@ -726,17 +691,14 @@ class RealtimeSegmentation3D:
             print("按 'r' 键重置容器")
             print("按 's' 键显示状态")
             print("按 'e' 键导出数据")
-        if self.position_solver is not None:
-            print("按 'p' 键显示放置状态")
-            print("按 'v' 键显示放置可视化")
         
         # 验证相机连接
+        print("[调试] 开始验证相机连接...")
         if not self.validate_camera_connection():
             print("❌ 相机连接验证失败，请检查相机连接后重试")
             return
+        print("[调试] 相机连接验证通过")
 
-
-        # Move to initial pose from robot config if provided
         try:
             if self.robot_config and os.path.exists(self.robot_config):
                 with open(self.robot_config, 'r', encoding='utf-8') as f:
@@ -765,41 +727,82 @@ class RealtimeSegmentation3D:
                         time.sleep(0.2)
         except Exception as e:
             print(f"加载/移动初始位姿失败: {e}")
-            
-        tcp_result = self.robot.get_tcp_position()
-        if isinstance(tcp_result, tuple) and len(tcp_result) == 2:
-            tcp_ok, original_tcp = tcp_result
-        else:
-            # 如果只返回一个值，假设它是位置信息
-            original_tcp = tcp_result
-            tcp_ok = True
+            import traceback
+            traceback.print_exc()
 
+        try:
+            tcp_result = self.robot.get_tcp_position()
+            if isinstance(tcp_result, tuple) and len(tcp_result) == 2:
+                tcp_ok, original_tcp = tcp_result
+            else:
+                # 如果只返回一个值，假设它是位置信息
+                original_tcp = tcp_result
+                tcp_ok = True
+            print(f"[调试] TCP位置获取成功: {original_tcp}")
+        except Exception as e:
+            print(f"[错误] 获取TCP位置失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return  # 如果无法获取TCP位置，提前返回
+
+        print("[调试] 开始加载鱼路径配置...")
         fish_count = 0 # count the number of fish in the container
         rows = -1
         cols = -1
-        # Load fish paths path from fish_grid_params.json
-        fish_paths_path = getattr(self, 'fish_paths_file', None)
-        if fish_paths_path is None:
-            # Try to load from fish_grid_params.json
-            try:
-                grid_params_path = "configs/fish_grid_params.json"
-                with open(grid_params_path, 'r', encoding='utf-8') as f:
-                    grid_params = json.load(f)
-                fish_paths_path = grid_params.get('output', {}).get('waypoints_json_path', 'configs/fish_paths.json')
-                grid = grid_params.get('grid', {})
-                rows = int(grid.get('rows', 0))
-                cols = int(grid.get('cols', 0))
-                print(f"从 fish_grid_params.json 加载路径: {fish_paths_path}, rows:{rows}, cols:{cols}")
-            except Exception as e:
-                print(f"无法从 fish_grid_params.json 加载路径，使用默认值: {e}")
-                fish_paths_path = 'configs/fish_paths.json'
+        fish_path_json = {}
+        
+        # 始终从 fish_grid_params.json 加载配置
+        grid_params_path = "configs/fish_grid_params.json"
+        print(f"[调试] 从 fish_grid_params.json 加载配置...")
         
         try:
+            with open(grid_params_path, 'r', encoding='utf-8') as f:
+                grid_params = json.load(f)
+            
+            # 从配置文件获取路径文件路径
+            fish_paths_path = grid_params.get('output', {}).get('waypoints_json_path')
+            if not fish_paths_path:
+                raise ValueError("fish_grid_params.json 中未找到 'output.waypoints_json_path' 字段")
+            print(f"[调试] 从 fish_grid_params.json 读取路径: {fish_paths_path}")
+            
+            # 获取网格配置
+            grid = grid_params.get('grid', {})
+            rows = int(grid.get('rows', 0))
+            cols = int(grid.get('cols', 0))
+            print(f"[调试] 网格配置: rows={rows}, cols={cols}")
+            
+            # 加载路径文件
+            print(f"[调试] 读取鱼路径文件: {fish_paths_path}")
             with open(fish_paths_path, 'r', encoding='utf-8') as f:
                 fish_path_json = json.load(f)
+            print(f"[调试] 成功加载鱼路径配置，包含 {len(fish_path_json)} 个位置")
+            
+            # 如果 rows 或 cols 无效，尝试从路径文件推断
+            if rows <= 0 or cols <= 0:
+                total_positions = len(fish_path_json)
+                if rows <= 0 and cols > 0:
+                    rows = max(1, total_positions // cols)
+                elif cols <= 0 and rows > 0:
+                    cols = max(1, total_positions // rows)
+                else:
+                    # 如果都不知道，假设是单列
+                    rows = total_positions
+                    cols = 1
+                print(f"[调试] 从路径文件推断 rows:{rows}, cols:{cols}")
+            
+        except FileNotFoundError:
+            print(f"[错误] 配置文件不存在: {grid_params_path}")
+            print(f"[错误] 请确保 {grid_params_path} 文件存在")
+            import traceback
+            traceback.print_exc()
+        except KeyError as e:
+            print(f"[错误] fish_grid_params.json 中缺少必要的字段: {e}")
+            import traceback
+            traceback.print_exc()
         except Exception as e:
-            print(f"加载鱼路径配置失败 {fish_paths_path}: {e}")
-            fish_path_json = {}
+            print(f"[错误] 加载配置失败: {e}")
+            import traceback
+            traceback.print_exc()
             
         try:
             while True:
@@ -920,17 +923,9 @@ class RealtimeSegmentation3D:
                 elif key == ord('e') and self.fish_tracker is not None:
                     print("用户按 'e' 键导出数据")
                     self.fish_tracker.export_data()
-                elif key == ord('p') and self.position_solver is not None:
-                    print("用户按 'p' 键显示放置状态")
-                    self.position_solver.print_placement_status()
-                elif key == ord('v') and self.position_solver is not None:
-                    print("用户按 'v' 键显示放置可视化")
-                    print(self.position_solver.visualize_placements())
 
                 # 根据掩码生成3D点云并保存（可选应用手眼标定）
                 points_gripper = None  # 初始化变量
-
-                #import pdb; pdb.set_trace()
                 if mask_vis is not None and base_name is not None:
                     # 点云生成计时
                     pointcloud_start = time.time()
@@ -939,8 +934,6 @@ class RealtimeSegmentation3D:
                     pointcloud_time = time.time() - pointcloud_start
                     self.timers['pointcloud_generation'].append(pointcloud_time)
                     print(f"⏱️  pointcloud_generation: {pointcloud_time:.3f}s")
-
-                    #import pdb; pdb.set_trace()
                     if len(points) > 0:
                         # 应用手眼变换：相机→夹爪
                         points_gripper = self.apply_hand_eye_transform(points)
@@ -1109,11 +1102,15 @@ class RealtimeSegmentation3D:
                     robot_movement_start = time.time()
                     
                     # 执行相对移动
-                    #import pdb; pdb.set_trace()    
                     fish_count += 1
-                    counter = rows*cols
-                    fish_count %= counter
-                    
+                    counter = rows * cols
+                    if counter <= 0:
+                        print(f"[错误] 无效的网格配置: rows={rows}, cols={cols}, counter={counter}")
+                        counter = len(fish_path_json) if fish_path_json else 1
+                        print(f"[警告] 使用路径文件数量作为计数器: {counter}")
+                    fish_count = ((fish_count - 1) % counter) + 1  # 确保 fish_count 在 1 到 counter 之间
+                    print(f"[调试] fish_count={fish_count}, counter={counter}, rows={rows}, cols={cols}")
+
                     self.robot.set_digital_output(0, 0, 1)
 
                     # catch fish
@@ -1123,7 +1120,12 @@ class RealtimeSegmentation3D:
                     self.robot.linear_move(original_tcp, 0 , True, 40)
                     
                     # get target point1
-                    xy_path = fish_path_json[str(fish_count)]
+                    fish_key = str(fish_count)
+                    if fish_key not in fish_path_json:
+                        print(f"[错误] 路径文件中不存在键 '{fish_key}'，可用键: {list(fish_path_json.keys())}")
+                        print(f"[错误] 跳过此次放置")
+                        continue
+                    xy_path = fish_path_json[fish_key]
                     joint_pos1 = [0, 0, 0, 0, 0, 0]
                     joint_pos1[0] = xy_path[0][0]
                     joint_pos1[1] = xy_path[0][1]
@@ -1131,8 +1133,8 @@ class RealtimeSegmentation3D:
                     joint_pos1[3] = 0
                     joint_pos1[4] = 0
                     joint_pos1[5] = 0
-
                     ret = self.robot.linear_move(joint_pos1, 1, True, 400)
+
                     joint_pos2 = [0, 0, 0, 0, 0, 0]
                     joint_pos2[0] = xy_path[1][0]
                     joint_pos2[1] = xy_path[1][1]
@@ -1140,6 +1142,7 @@ class RealtimeSegmentation3D:
                     joint_pos2[3] = 0
                     joint_pos2[4] = 0
                     joint_pos2[5] = 0
+                    ret = self.robot.linear_move(joint_pos2, 1, True, 400)
 
                     target_xy = [xy_path[0][0] + xy_path[1][0], xy_path[0][1] + xy_path[1][1]]
                     start_xy = [original_tcp[0], original_tcp[1]]
@@ -1153,21 +1156,16 @@ class RealtimeSegmentation3D:
                     # 若仍未得到 alpha_1，则置为 0
                     if alpha_1 is None:
                         alpha_1 = 0.0
-                    ret = self.robot.linear_move([start_xy[0], start_xy[1], 0, 0, 0, 0], 1 , True, 400)
-                    print("fish : {}".format(fish_count))
-                    print(joint_pos1)
-                    print(joint_pos2)
-                    # move to target point2
-                    ret = self.robot.linear_move(joint_pos2, 1, True, 400)
-
+                   
                     offset_angle = np.pi / 2 - alpha_1 - alpha_2
                     print(f"offset_angle: {offset_angle:.4f}")
 
                     # rotate joint6 make sure the fish is vertical
                     ret = self.robot.joint_move([0, 0, 0, 0, 0, offset_angle], 1, True, 2)
                     self.robot.set_digital_output(0, 1, 1)
-                    time.sleep(0.1)
-                    ret = self.robot.linear_move([-joint_pos2[0], -joint_pos2[1], 200, 0, 0, 0], 1 , True, 400)
+                    time.sleep(0.2)
+                    ret = self.robot.joint_move([0, 0, 0, 0, 0, -offset_angle], 1, True, 2)
+                    ret = self.robot.linear_move([0, -joint_pos2[1], 200, 0, 0, 0], 1 , True, 400)
                     self.robot.linear_move(original_tcp, 0 , True, 200)
                     self.robot.set_digital_output(0,0,0)
                     self.robot.set_digital_output(0,1,0)
@@ -1250,8 +1248,6 @@ def main():
                       help='启用鱼重量跟踪功能')
     parser.add_argument('--max_container_weight', type=float, default=12.5,
                       help='容器最大重量（kg），默认12.5kg')
-    parser.add_argument('--fish_paths', type=str, default='configs/fish_paths.json',
-                      help='鱼路径配置JSON文件路径 (默认: configs/fish_paths.json)')
     parser.add_argument('--camera_calib_json', type=str, default=None,
                       help='手眼标定JSON文件路径，包含 hand_eye.R 和 hand_eye.t')
     parser.add_argument('--robot_config', type=str, default='configs/robot.json',
@@ -1276,7 +1272,6 @@ def main():
             enable_weight_tracking=args.enable_weight_tracking,
             max_container_weight=args.max_container_weight,
             det_gray=args.det_gray,
-            fish_paths_file=args.fish_paths,
             camera_calib_json=args.camera_calib_json,
             robot_config=args.robot_config
         )

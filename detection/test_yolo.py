@@ -275,90 +275,80 @@ def generate_labelme_annotations(model, source_path: str, args):
     project_dir.mkdir(parents=True, exist_ok=True)
     output_dir = Path(args.project) / (args.name or "annotations")
     
-    # 先运行一次批量预测，确保所有可视化结果保存到指定目录
-    print(f"[标注] 批量预测并保存可视化结果到: {output_dir}")
-    results = model.predict(
-        source=[str(p) for p in image_files],
-        imgsz=args.imgsz,
-        conf=args.conf,
-        iou=args.iou,
-        device=args.device if args.device else None,
-        verbose=False,
-        save=True,
-        project=args.project,
-        name=args.name or "annotations",
-    )
-    
+    # 流式推理并即时写出标注，避免一次性占用大量显存/内存
+    print(f"[标注] 流式预测并保存可视化到: {output_dir}")
     processed_count = 0
     failed_count = 0
-    
-    for idx, img_path in enumerate(image_files):
-        try:
-            # 获取对应的预测结果
-            res = results[idx] if results and idx < len(results) else None
-            if res is None:
-                print(f"[错误] 缺少预测结果: {img_path}")
-                failed_count += 1
-                continue
-            
-            # 获取图像尺寸
-            if hasattr(res, 'orig_shape') and res.orig_shape is not None:
-                img_height, img_width = int(res.orig_shape[0]), int(res.orig_shape[1])
-            else:
-                # 回退读取图像
-                original_img = cv2.imread(str(img_path))
-                if original_img is None:
-                    print(f"[错误] 无法读取图像: {img_path}")
+
+    try:
+        for res in model.predict(
+            source=[str(p) for p in image_files],
+            imgsz=args.imgsz,
+            conf=args.conf,
+            iou=args.iou,
+            device=args.device if args.device else None,
+            verbose=False,
+            save=True,
+            project=args.project,
+            name=args.name or "annotations",
+            stream=True,
+        ):
+            try:
+                # 结果对象自带路径与原图尺寸
+                img_path = Path(getattr(res, 'path', ''))
+                if not img_path:
+                    # 回退：无法获得路径时跳过
                     failed_count += 1
                     continue
-                img_height, img_width = original_img.shape[:2]
-            
-            # 构建LabelMe格式的JSON
-            labelme_data = {
-                "version": "5.8.3",
-                "flags": {},
-                "shapes": [],
-                "imagePath": img_path.name,
-                "imageData": None,
-                "imageHeight": img_height,
-                "imageWidth": img_width
-            }
-            
-            # 处理检测结果
-            if hasattr(res, 'boxes') and res.boxes is not None:
-                for i, box in enumerate(res.boxes):
-                    # 获取边界框坐标
-                    x1, y1, x2, y2 = [float(v) for v in box.xyxy[0].tolist()]
-                    conf = float(box.conf[0].tolist())
-                    cls = int(box.cls[0].tolist())
-                    
-                    # 创建矩形标注（LabelMe）
-                    shape = {
-                        "label": "鱿鱼",
-                        "points": [[x1, y1], [x2, y2]],
-                        "group_id": None,
-                        "description": f"confidence: {conf:.3f}",
-                        "shape_type": "rectangle",
-                        "flags": {},
-                        "mask": None
-                    }
-                    labelme_data["shapes"].append(shape)
-            
-            # 文件名
-            json_filename = img_path.stem + ".json"
-            json_path = output_dir / json_filename
-            
-            # 保存JSON
-            with open(json_path, 'w', encoding='utf-8') as f:
-                json.dump(labelme_data, f, ensure_ascii=False, indent=2)
-            
-            # 可视化由 Ultralytics 自动保存至同目录
-            print(f"[成功] {img_path.name} -> {json_filename} (检测到 {len(labelme_data['shapes'])} 个目标)")
-            processed_count += 1
-            
-        except Exception as e:
-            print(f"[错误] 处理图像失败 {img_path.name}: {e}")
-            failed_count += 1
+
+                if hasattr(res, 'orig_shape') and res.orig_shape is not None:
+                    img_height, img_width = int(res.orig_shape[0]), int(res.orig_shape[1])
+                else:
+                    original_img = cv2.imread(str(img_path))
+                    if original_img is None:
+                        print(f"[错误] 无法读取图像: {img_path}")
+                        failed_count += 1
+                        continue
+                    img_height, img_width = original_img.shape[:2]
+
+                labelme_data = {
+                    "version": "5.8.3",
+                    "flags": {},
+                    "shapes": [],
+                    "imagePath": img_path.name,
+                    "imageData": None,
+                    "imageHeight": img_height,
+                    "imageWidth": img_width
+                }
+
+                if hasattr(res, 'boxes') and res.boxes is not None:
+                    for box in res.boxes:
+                        x1, y1, x2, y2 = [float(v) for v in box.xyxy[0].tolist()]
+                        conf = float(box.conf[0].tolist())
+                        cls = int(box.cls[0].tolist())
+                        shape = {
+                            "label": "鱿鱼",
+                            "points": [[x1, y1], [x2, y2]],
+                            "group_id": None,
+                            "description": f"confidence: {conf:.3f}",
+                            "shape_type": "rectangle",
+                            "flags": {},
+                            "mask": None
+                        }
+                        labelme_data["shapes"].append(shape)
+
+                json_filename = img_path.stem + ".json"
+                json_path = output_dir / json_filename
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(labelme_data, f, ensure_ascii=False, indent=2)
+
+                print(f"[成功] {img_path.name} -> {json_filename} (检测到 {len(labelme_data['shapes'])} 个目标)")
+                processed_count += 1
+            except Exception as e:
+                print(f"[错误] 处理图像失败 {getattr(res, 'path', 'unknown')}: {e}")
+                failed_count += 1
+    except Exception as e:
+        print(f"[错误] 批处理预测失败: {e}")
     
     # 输出统计信息
     print("\n" + "="*60)
@@ -445,8 +435,10 @@ def main():
             # 单个文件或其他流式输入，直接传递
             sources = [str(src)]
 
-        results = model.predict(
-            source=[str(p) for p in sources],
+        last_save_dir = None
+        # 使用流式推理避免一次性将所有结果保存在内存/显存中
+        for res in model.predict(
+            source=str(src) if src.is_dir() else [str(src)],
             imgsz=args.imgsz,
             conf=args.conf,
             iou=args.iou,
@@ -457,8 +449,10 @@ def main():
             save_txt=args.save_txt,
             save_conf=args.save_conf,
             verbose=True,
-        )
-        print("推理完成。结果目录:", results[0].save_dir if results else args.project)
+            stream=True,
+        ):
+            last_save_dir = getattr(res, 'save_dir', None)
+        print("推理完成。结果目录:", last_save_dir or args.project)
 
 
 if __name__ == "__main__":
