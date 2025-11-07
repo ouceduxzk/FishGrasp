@@ -235,7 +235,7 @@ class RealtimeSegmentation3D:
                     [ 0.06027516, -0.99770511,  0.03084494],
                     [-0.02313391,  0.02949655,  0.99929714]
                 ], dtype=np.float32)
-                t_default = np.array([[0.04], [0.113], [-0.22081495]], dtype=np.float32)
+                t_default = np.array([[0.04], [0.095], [-0.22081495]], dtype=np.float32)
                 self.hand_eye_transform = np.eye(4, dtype=np.float32)
                 self.hand_eye_transform[:3, :3] = R_default
                 self.hand_eye_transform[:3, 3:4] = t_default
@@ -906,6 +906,33 @@ class RealtimeSegmentation3D:
                     except Exception:
                         landmark_vis = None
                 
+                # 在landmark_vis上绘制质心十字标记
+                if landmark_vis is not None and mask_vis is not None:
+                    try:
+                        # 计算掩码的质心
+                        ys, xs = np.where(mask_vis > 0)
+                        if ys.size > 0 and xs.size > 0:
+                            centroid_x = int(np.mean(xs))
+                            centroid_y = int(np.mean(ys))
+                            
+                            # 绘制十字标记
+                            cross_size = 25
+                            cross_thickness = 4
+                            cross_color = (0, 255, 255)  # 黄色 (BGR)
+                            
+                            # 水平线
+                            cv2.line(landmark_vis, 
+                                   (centroid_x - cross_size, centroid_y), 
+                                   (centroid_x + cross_size, centroid_y), 
+                                   cross_color, cross_thickness)
+                            # 垂直线
+                            cv2.line(landmark_vis, 
+                                   (centroid_x, centroid_y - cross_size), 
+                                   (centroid_x, centroid_y + cross_size), 
+                                   cross_color, cross_thickness)
+                    except Exception as e:
+                        print(f"[可视化] 绘制质心标记失败: {e}")
+                
                 # 显示预览窗口
                 self.show_preview(color_image, depth_image, mask_vis, detection_vis, landmark_vis)
                 
@@ -1085,6 +1112,40 @@ class RealtimeSegmentation3D:
                         delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
                         z_offset = -delta_tool_mm[2] -30
                         relative_move = [delta_base_xyz[0], delta_base_xyz[1], z_offset, 0, 0, 0]
+                        
+                        # 在质心模式下，确保alpha_1的方向一致性
+                        # PCA可能返回两个相反的方向，导致角度不一致（有时旋转90度）
+                        # 预览图像中的箭头是正确的，说明(vx, vy)方向是正确的
+                        # 我们需要确保使用的角度与预览图像一致
+                        if alpha_1 is not None and mask_vis is not None:
+                            try:
+                                # 重新计算PCA，获取方向向量（与预览图像使用相同的计算）
+                                alpha_1_raw, (vx, vy), _ = estimate_body_angle_alpha1(mask_vis > 0, return_details=True)
+                                
+                                # # 使用与预览图像相同的方向向量重新计算角度
+                                # # 确保角度计算与预览图像一致
+                                # alpha_1_new = np.arctan2(vx, vy)
+                                
+                                # # 将角度规范化到[0, pi]范围内
+                                # # alpha_1是相对于图像y轴的角度，范围是[-pi, pi]
+                                # # 我们需要将其映射到[0, pi]范围
+                                # # 方法：如果角度是负的，加上2*pi，然后取模到[0, 2*pi]，最后如果超过pi，取补角
+                                # if alpha_1_new < 0:
+                                #     alpha_1_new = alpha_1_new + 2 * np.pi
+                                # # 如果角度在[pi, 2*pi]范围内，映射到[0, pi]（取补角）
+                                # if alpha_1_new > np.pi:
+                                #     alpha_1_new = 2 * np.pi - alpha_1_new
+                                
+                                # 确保角度在[0, pi]范围内
+                                alpha_1_new = (alpha_1_raw + np.pi) % np.pi 
+                                
+                                alpha_1 = alpha_1_new
+                                print(f"[质心模式] 原始alpha_1: {alpha_1_raw:.4f} rad ({np.degrees(alpha_1_raw):.2f} deg)")
+                                print(f"[质心模式] 修正后的alpha_1: {alpha_1:.4f} rad ({np.degrees(alpha_1):.2f} deg), vx={vx:.3f}, vy={vy:.3f}")
+                            except Exception as e:
+                                print(f"[质心模式] 修正alpha_1失败: {e}，使用原始值")
+                                import traceback
+                                traceback.print_exc()
                     
                     grasp_calc_time = time.time() - grasp_calc_start
                     self.timers['grasp_calculation'].append(grasp_calc_time)
@@ -1101,13 +1162,9 @@ class RealtimeSegmentation3D:
                     
                     # 机器人移动计时
                     robot_movement_start = time.time()
-                    delta_rad = float(alpha_1)
-                    delta_rad = ((delta_rad + np.pi) % (2 * np.pi)) - np.pi
-                    delta_rad = abs(delta_rad)
-                    if delta_rad > np.pi / 2:
-                        delta_rad = np.pi - delta_rad
-                    delta_rad = np.clip(delta_rad, 0.0, np.pi / 2)
-                    print(f"delta_rad: {delta_rad:.4f}")
+                    # delta_rad = float(alpha_1)
+                    # delta_rad = np.clip(delta_rad, 0, np.pi)
+                  
                     self.robot.joint_move([0,0,0,0,0,np.pi/2-alpha_1], 1, True, 1)
                     time.sleep(0.5)
                     

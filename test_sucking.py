@@ -42,16 +42,16 @@ robot.enable_robot()
 debugRobotPath = True
 
 # ret = robot.joint_move([np.pi * 0.9 , 0, 0, 0, 0, 0], 1, True, 1)
-ret = robot.joint_move([-193.484*np.pi/180,
-                        98.108*np.pi/180, 
-                        -64.836*np.pi/180, 
-                        56.796*np.pi/180,
-                        -270.49*np.pi/180, 
-                        168.094*np.pi/180], 0, False, 1)
+ret = robot.joint_move([-204.939*np.pi/180,
+                        101.019*np.pi/180, 
+                        -62.559*np.pi/180, 
+                        53.687*np.pi/180,
+                        -269.533*np.pi/180, 
+                        -203.005*np.pi/180], 0, False, 0.5)
 
 time.sleep(1)
 
-robot.set_digital_output(0, 0, 0)
+#robot.set_digital_output(0, 0, 1)
 #time.sleep(10)
 #robot.set_digital_output(0, 0, 0)
 
@@ -103,15 +103,15 @@ robot.set_digital_output(0, 0, 0)
 #
 #   ret = robot.linear_move([0,-joint_pos2[1],200,0,0,0], 1, True, 100)
 #
-#   ret = robot.joint_move([-193.484*np.pi/180,
-#                       98.108*np.pi/180, 
-#                       -64.836*np.pi/180, 
-#                       56.796*np.pi/180,
-#                       -270.49*np.pi/180, 
-#                       168.094*np.pi/180], 0, False, 1)
+#   ret = robot.joint_move([-204.939*np.pi/180,
+#                        101.019*np.pi/180, 
+#                        -62.559*np.pi/180, 
+#                        53.687*np.pi/180,
+#                        -269.533*np.pi/180, 
+#                        -203.005*np.pi/180], 0, False, 1)
 #
 #   time.sleep(1)
 #
 #   print("times:",n)
 
-#robot.logout()
+robot.logout()
