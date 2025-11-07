@@ -231,11 +231,11 @@ class RealtimeSegmentation3D:
                 print(f"读取 camera_calib_json 失败: {e}")
             if not loaded_json:
                 R_default = np.array([
-                    [-0.99791369, -0.06094636, -0.02130291],
-                    [ 0.06027516, -0.99770511,  0.03084494],
-                    [-0.02313391,  0.02949655,  0.99929714]
+                    [-0.99455141, -0.08982915, -0.05289825],
+                    [ 0.09064269, -0.99579624, -0.01318166],
+                    [-0.05149178, -0.01790468,  0.9985129 ]
                 ], dtype=np.float32)
-                t_default = np.array([[0.04], [0.095], [-0.22081495]], dtype=np.float32)
+                t_default = np.array([[0.07037777], [0.09996735], [-0.18889416]], dtype=np.float32)
                 self.hand_eye_transform = np.eye(4, dtype=np.float32)
                 self.hand_eye_transform[:3, :3] = R_default
                 self.hand_eye_transform[:3, 3:4] = t_default
@@ -346,7 +346,7 @@ class RealtimeSegmentation3D:
         detection_start = time.time()
         #if getattr(self, 'use_yolo', False):
         # YOLO 路径：detect_yolo 已返回所有满足条件的框 (x1,y1,x2,y2,conf)
-        boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.5, iou=0.45, imgsz=640, min_area=2500)
+        boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.25, iou=0.45, imgsz=640, min_area=2500)
        
         detection_time = time.time() - detection_start
         self.timers['detection'].append(detection_time)
@@ -854,7 +854,7 @@ class RealtimeSegmentation3D:
                 if mask_vis is not None:
                     # 重新运行检测以获取边界框可视化
                     #if getattr(self, 'use_yolo', False):
-                    boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.5, iou=0.45, imgsz=640)
+                    boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.25, iou=0.45, imgsz=640)
                   
                     if boxes:
                         detection_vis = color_image.copy()
@@ -1107,10 +1107,46 @@ class RealtimeSegmentation3D:
                         # 质心点（夹爪系）
                         centroid = np.mean(points_gripper, axis=0)
                         print(f"夹爪坐标系点云质心: {centroid}")
-                        center_gripper_mm = centroid * 1000
+                        
+                        # 将质心沿着主方向移动5mm
+                        try:
+                            if len(points_gripper) > 10:
+                                # 使用点云在XY平面的投影计算主方向
+                                points_xy = points_gripper[:, :2]  # 只取XY坐标（米）
+                                points_centered = points_xy - points_xy.mean(axis=0)
+                                
+                                # SVD计算主方向
+                                U, S, Vt = np.linalg.svd(points_centered, full_matrices=False)
+                                dir_xy = Vt[0, :]  # 主方向向量 (dx, dy)，单位向量
+                                
+                                # 确保方向一致性：选择指向正X方向的方向
+                                if dir_xy[0] < 0:
+                                    dir_xy = -dir_xy
+                                
+                                # 将质心沿着主方向移动5mm（0.005米）
+                                offset_m = 0.0025 # 5mm
+                                centroid_offset = centroid.copy()
+                                centroid_offset[0] += dir_xy[0] * offset_m
+                                centroid_offset[1] += dir_xy[1] * offset_m
+                                # Z坐标保持不变
+                                
+                                print(f"📐 主方向向量: ({dir_xy[0]:.4f}, {dir_xy[1]:.4f})")
+                                print(f"📍 移动前质心: {centroid}")
+                                print(f"📍 移动后质心（沿主方向+5mm）: {centroid_offset}")
+                                
+                                center_gripper_mm = centroid_offset * 1000
+                            else:
+                                # 如果点云太少，使用原始质心
+                                print("⚠️ 点云点数太少，使用原始质心")
+                                center_gripper_mm = centroid * 1000
+                        except Exception as e:
+                            # 如果计算失败，使用原始质心
+                            print(f"⚠️ 计算主方向失败: {e}，使用原始质心")
+                            center_gripper_mm = centroid * 1000
+                        
                         delta_tool_mm = [center_gripper_mm[0], center_gripper_mm[1], center_gripper_mm[2]]
                         delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
-                        z_offset = -delta_tool_mm[2] -30
+                        z_offset = -delta_tool_mm[2]
                         relative_move = [delta_base_xyz[0], delta_base_xyz[1], z_offset, 0, 0, 0]
                         
                         # 在质心模式下，确保alpha_1的方向一致性
