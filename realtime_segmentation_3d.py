@@ -41,6 +41,7 @@ from util import (
     tool_offset_to_base as util_tool_offset_to_base,
 )
 from mask_to_3d import mask_to_3d_pointcloud, save_pointcloud, load_camera_intrinsics
+from filter_mask import divide_mask
 from realsense_capture import (
     setup_realsense,
     save_pointcloud_to_file,
@@ -235,7 +236,7 @@ class RealtimeSegmentation3D:
                     [ 0.09064269, -0.99579624, -0.01318166],
                     [-0.05149178, -0.01790468,  0.9985129 ]
                 ], dtype=np.float32)
-                t_default = np.array([[0.07037777], [0.09996735], [-0.18889416]], dtype=np.float32)
+                t_default = np.array([[0.0607777], [0.09996735], [-0.18889416]], dtype=np.float32)
                 self.hand_eye_transform = np.eye(4, dtype=np.float32)
                 self.hand_eye_transform[:3, :3] = R_default
                 self.hand_eye_transform[:3, 3:4] = t_default
@@ -346,7 +347,7 @@ class RealtimeSegmentation3D:
         detection_start = time.time()
         #if getattr(self, 'use_yolo', False):
         # YOLO 路径：detect_yolo 已返回所有满足条件的框 (x1,y1,x2,y2,conf)
-        boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.25, iou=0.45, imgsz=640, min_area=2500)
+        boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.5, iou=0.45, imgsz=640, min_area=2500)
        
         detection_time = time.time() - detection_start
         self.timers['detection'].append(detection_time)
@@ -394,6 +395,18 @@ class RealtimeSegmentation3D:
             restricted_mask = np.zeros_like(mask_np, dtype=np.uint8)
             restricted_mask[y1:y2, x1:x2] = mask_np[y1:y2, x1:x2]
             mask_np = restricted_mask
+
+            # 应用divide_mask优化mask，提取最大连通区域
+            try:
+                mask_np_refined = divide_mask(mask_np, verbose=False)
+                # 确保返回的mask格式一致（0/255）
+                if mask_np_refined.max() <= 1:
+                    mask_np_refined = mask_np_refined * 255
+                mask_np = mask_np_refined.astype(np.uint8)
+            except Exception as e:
+                # 如果优化失败，使用原始mask
+                if self.debug:
+                    print(f"[优化] 候选框 {i} mask优化失败，使用原始mask: {e}")
 
             # 计算点云并求质心深度（相机坐标系，单位米）
             mask_bool = (mask_np > 0)
@@ -448,7 +461,7 @@ class RealtimeSegmentation3D:
         return best_mask, base_name
 
 
-    def detect_yolo(self, color_image, yolo_weights_path, conf=0.25, iou=0.45, imgsz=640, min_area=1000):
+    def detect_yolo(self, color_image, yolo_weights_path, conf=0.5, iou=0.45, imgsz=640, min_area=1000):
         """
         使用Ultralytics YOLO进行鱼的检测，返回所有检测到的bbox。
         
@@ -854,7 +867,7 @@ class RealtimeSegmentation3D:
                 if mask_vis is not None:
                     # 重新运行检测以获取边界框可视化
                     #if getattr(self, 'use_yolo', False):
-                    boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.25, iou=0.45, imgsz=640)
+                    boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.5, iou=0.45, imgsz=640)
                   
                     if boxes:
                         detection_vis = color_image.copy()
@@ -968,8 +981,8 @@ class RealtimeSegmentation3D:
                         # 保存点云（仅在debug模式下）
                         if self.debug:
                             # 保存相机坐标系点云
-                            cam_ply = os.path.join(self.pointcloud_dir, f"{base_name}_cam_pointcloud.ply")
-                            save_pointcloud_to_file(points, colors, cam_ply)
+                            # cam_ply = os.path.join(self.pointcloud_dir, f"{base_name}_cam_pointcloud.ply")
+                            # save_pointcloud_to_file(points, colors, cam_ply)
                             # 保存夹爪坐标系点云
                             grip_ply = os.path.join(self.pointcloud_dir, f"{base_name}_gripper_pointcloud.ply")
                             save_pointcloud_to_file(points_gripper, colors, grip_ply)
@@ -1124,7 +1137,7 @@ class RealtimeSegmentation3D:
                                     dir_xy = -dir_xy
                                 
                                 # 将质心沿着主方向移动5mm（0.005米）
-                                offset_m = 0.0025 # 5mm
+                                offset_m = 0.00 # 5mm
                                 centroid_offset = centroid.copy()
                                 centroid_offset[0] += dir_xy[0] * offset_m
                                 centroid_offset[1] += dir_xy[1] * offset_m
