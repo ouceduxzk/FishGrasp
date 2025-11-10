@@ -84,7 +84,7 @@ except ImportError:
 class RealtimeSegmentation3D:
     def __init__(self, output_dir, device="cpu", save_pointcloud=True, intrinsics_file=None, hand_eye_file=None, bbox_selection="highest_confidence", debug=False, use_yolo=False, yolo_weights=None,
                  grasp_point_mode: str = "centroid", landmark_model_path: str = None, enable_weight_tracking: bool = True, max_container_weight: float = 12.5, det_gray: bool = False,
-                 camera_calib_json: str = None, robot_config: str = "config/robot.json"):
+                 camera_calib_json: str = None, robot_config: str = "config/robot.json", erode_bbox: bool = False, erode_ratio: float = 0.1, bbox_scale: float = 1.0):
         """
         初始化实时分割和3D点云生成器
         
@@ -102,6 +102,9 @@ class RealtimeSegmentation3D:
             landmark_model_path: AI关键点模型路径
             enable_weight_tracking: 是否启用重量跟踪
             max_container_weight: 容器最大重量（kg）
+            erode_bbox: 是否对mask进行上下方向腐蚀（用于更精确的质心计算）
+            erode_ratio: 腐蚀比例，上下各腐蚀的比例（默认0.1，即10%）
+            bbox_scale: 边界框缩放因子（默认1.0，即不缩放；>1.0放大，<1.0缩小）
         """
         self.output_dir = output_dir
         self.device = device
@@ -110,6 +113,9 @@ class RealtimeSegmentation3D:
         self.debug = debug
         self.use_yolo = use_yolo
         self.yolo_weights = yolo_weights
+        self.erode_bbox = erode_bbox
+        self.erode_ratio = erode_ratio
+        self.bbox_scale = bbox_scale
         # detection-only grayscale support (optional)
         self.det_gray = det_gray
         # 抓取点模式：centroid 或 ai
@@ -347,7 +353,7 @@ class RealtimeSegmentation3D:
         detection_start = time.time()
         #if getattr(self, 'use_yolo', False):
         # YOLO 路径：detect_yolo 已返回所有满足条件的框 (x1,y1,x2,y2,conf)
-        boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.5, iou=0.45, imgsz=640, min_area=2500)
+        boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.25, iou=0.45, imgsz=640, min_area=2500)
        
         detection_time = time.time() - detection_start
         self.timers['detection'].append(detection_time)
@@ -408,20 +414,45 @@ class RealtimeSegmentation3D:
                 if self.debug:
                     print(f"[优化] 候选框 {i} mask优化失败，使用原始mask: {e}")
 
-            # 计算点云并求质心深度（相机坐标系，单位米）
+            # 应用垂直腐蚀（如果启用）
+            if self.erode_bbox:
+                mask_np = self.erode_mask_vertical(mask_np)
+
+            # 使用2D质心+深度计算深度（相机坐标系，单位米）
             mask_bool = (mask_np > 0)
             if not np.any(mask_bool):
                 print(f"[分割] 候选框 {i} 掩码为空，跳过")
                 continue
 
-            points, colors = self.generate_pointcloud(color_image, depth_image, mask_bool)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          
-            if points is None or len(points) == 0:
-                print(f"[点云] 候选框 {i} 点云为空，跳过")
+            # 计算2D质心
+            try:
+                ys_mask, xs_mask = np.where(mask_bool)
+                if ys_mask.size == 0 or xs_mask.size == 0:
+                    print(f"[分割] 候选框 {i} 掩码为空，跳过")
+                    continue
+                
+                centroid_x_2d = int(np.mean(xs_mask))
+                centroid_y_2d = int(np.mean(ys_mask))
+                
+                # 确保坐标在图像范围内
+                h, w = depth_image.shape
+                centroid_x_2d = max(0, min(w - 1, centroid_x_2d))
+                centroid_y_2d = max(0, min(h - 1, centroid_y_2d))
+                
+                # 获取深度值（毫米）
+                depth_mm = depth_image[int(centroid_y_2d), int(centroid_x_2d)]
+                
+                if depth_mm > 0:
+                    # 转换为米
+                    depth_m = depth_mm / 1000.0
+                    print(f"候选框 {i} 2D质心: ({centroid_x_2d}, {centroid_y_2d}), 深度: {depth_m:.4f} m  bbox=({x1},{y1},{x2},{y2})")
+                else:
+                    print(f"[深度] 候选框 {i} 质心位置深度值为0，跳过")
+                    continue
+                    
+            except Exception as e:
+                print(f"[计算] 候选框 {i} 计算2D质心深度失败: {e}，跳过")
                 continue
-
-            centroid = np.mean(points, axis=0)  # (x,y,z) in meters (cam frame)
-            depth_m = float(centroid[2])
-            print(f"候选框 {i} 质心深度: {depth_m:.4f} m  bbox=({x1},{y1},{x2},{y2})")
 
             # 记录调试输出
             if self.debug:
@@ -461,7 +492,7 @@ class RealtimeSegmentation3D:
         return best_mask, base_name
 
 
-    def detect_yolo(self, color_image, yolo_weights_path, conf=0.5, iou=0.45, imgsz=640, min_area=1000):
+    def detect_yolo(self, color_image, yolo_weights_path, conf=0.25, iou=0.45, imgsz=640, min_area=1000):
         """
         使用Ultralytics YOLO进行鱼的检测，返回所有检测到的bbox。
         
@@ -519,6 +550,11 @@ class RealtimeSegmentation3D:
         valid_boxes = []
         for i, xyxy in enumerate(boxes_np):
             x1, y1, x2, y2 = [int(round(v)) for v in xyxy[:4].tolist()]
+            
+            # 应用边界框缩放（在YOLO检测后立即应用）
+            x1, y1, x2, y2 = self.scale_bbox(x1, y1, x2, y2, H, W)
+            
+            # 确保坐标在图像范围内（缩放后再次检查）
             x1 = max(0, min(x1, W - 1))
             y1 = max(0, min(y1, H - 1))
             x2 = max(0, min(x2, W - 1))
@@ -583,6 +619,136 @@ class RealtimeSegmentation3D:
     def apply_hand_eye_transform(self, points):
         """使用 util.apply_hand_eye_transform 应用手眼标定变换"""
         return util_apply_hand_eye_transform(points, self.hand_eye_transform)
+    
+    def pixel_to_3d_camera(self, u, v, depth_mm):
+        """
+        将2D像素坐标和深度值转换为3D相机坐标系坐标
+        
+        Args:
+            u: 像素x坐标
+            v: 像素y坐标
+            depth_mm: 深度值（毫米）
+        
+        Returns:
+            point_3d: 3D点坐标 (X, Y, Z) 单位：米（相机坐标系）
+        """
+        # 转换深度单位为米
+        z_m = depth_mm / 1000.0
+        
+        # 使用相机内参将像素坐标转换为3D坐标
+        # X = (u - cx) / fx * z
+        # Y = (v - cy) / fy * z
+        # Z = z
+        X = (u - self.cx) / self.fx * z_m
+        Y = (v - self.cy) / self.fy * z_m
+        Z = z_m
+        
+        return np.array([X, Y, Z], dtype=np.float32)
+    
+    def scale_bbox(self, x1, y1, x2, y2, image_height, image_width):
+        """
+        从中心点缩放边界框
+        
+        Args:
+            x1, y1, x2, y2: 原始边界框坐标
+            image_height: 图像高度
+            image_width: 图像宽度
+        
+        Returns:
+            scaled_x1, scaled_y1, scaled_x2, scaled_y2: 缩放后的边界框坐标
+        """
+        if self.bbox_scale == 1.0:
+            return x1, y1, x2, y2
+        
+        # 计算中心点和尺寸
+        center_x = (x1 + x2) / 2.0
+        center_y = (y1 + y2) / 2.0
+        width = x2 - x1
+        height = y2 - y1
+        
+        # 缩放尺寸
+        new_width = width * self.bbox_scale
+        new_height = height * self.bbox_scale
+        
+        # 计算新的边界框坐标
+        scaled_x1 = int(center_x - new_width / 2.0)
+        scaled_y1 = int(center_y - new_height / 2.0)
+        scaled_x2 = int(center_x + new_width / 2.0)
+        scaled_y2 = int(center_y + new_height / 2.0)
+        
+        # 裁剪到图像范围内
+        scaled_x1 = max(0, min(scaled_x1, image_width - 1))
+        scaled_y1 = max(0, min(scaled_y1, image_height - 1))
+        scaled_x2 = max(0, min(scaled_x2, image_width - 1))
+        scaled_y2 = max(0, min(scaled_y2, image_height - 1))
+        
+        # 确保 x2 > x1 和 y2 > y1
+        if scaled_x2 <= scaled_x1:
+            scaled_x2 = scaled_x1 + 1
+        if scaled_y2 <= scaled_y1:
+            scaled_y2 = scaled_y1 + 1
+        
+        if self.debug and self.bbox_scale != 1.0:
+            print(f"[缩放] 原始bbox: ({x1}, {y1}, {x2}, {y2}), 缩放后: ({scaled_x1}, {scaled_y1}, {scaled_x2}, {scaled_y2}), 缩放因子: {self.bbox_scale}")
+        
+        return scaled_x1, scaled_y1, scaled_x2, scaled_y2
+    
+    def erode_mask_vertical(self, mask):
+        """
+        对mask进行上下方向的腐蚀，去除边界区域以获得更精确的质心
+        
+        Args:
+            mask: 二值mask（numpy数组，0/255格式）
+        
+        Returns:
+            eroded_mask: 腐蚀后的mask
+        """
+        if not self.erode_bbox:
+            return mask
+        
+        try:
+            # 转换为二值格式（0/1）
+            mask_bool = (mask > 0).astype(np.uint8)
+            
+            # 找到mask的有效区域（非零区域）
+            ys, xs = np.where(mask_bool > 0)
+            if ys.size == 0 or xs.size == 0:
+                return mask
+            
+            y_min = int(ys.min())
+            y_max = int(ys.max())
+            height = y_max - y_min + 1
+            
+            # 计算上下各腐蚀的像素数
+            erode_pixels = int(height * self.erode_ratio)
+            
+            if erode_pixels > 0 and height > erode_pixels * 2:
+                # 创建腐蚀后的mask
+                eroded_mask = np.zeros_like(mask_bool)
+                
+                # 只保留中间部分（去除上下各10%）
+                y_start = y_min + erode_pixels
+                y_end = y_max - erode_pixels + 1
+                
+                # 复制中间部分
+                eroded_mask[y_start:y_end, :] = mask_bool[y_start:y_end, :]
+                
+                # 转换回0/255格式
+                eroded_mask = eroded_mask.astype(np.uint8) * 255
+                
+                if self.debug:
+                    print(f"[腐蚀] 原始高度: {height}, 腐蚀像素: {erode_pixels}, 保留高度: {y_end - y_start}")
+                
+                return eroded_mask
+            else:
+                # 如果mask太小，不进行腐蚀
+                if self.debug:
+                    print(f"[腐蚀] Mask太小（高度={height}），跳过腐蚀")
+                return mask
+                
+        except Exception as e:
+            print(f"[腐蚀] 腐蚀mask失败: {e}，返回原始mask")
+            return mask
 
     def _rpy_to_rotation_matrix(self, rx, ry, rz):
         # 保留兼容方法但委托到 util（如后续直接调用 util，可删除此方法）
@@ -867,7 +1033,7 @@ class RealtimeSegmentation3D:
                 if mask_vis is not None:
                     # 重新运行检测以获取边界框可视化
                     #if getattr(self, 'use_yolo', False):
-                    boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.5, iou=0.45, imgsz=640)
+                    boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.25, iou=0.45, imgsz=640)
                   
                     if boxes:
                         detection_vis = color_image.copy()
@@ -919,30 +1085,43 @@ class RealtimeSegmentation3D:
                     except Exception:
                         landmark_vis = None
                 
-                # 在landmark_vis上绘制质心十字标记
-                if landmark_vis is not None and mask_vis is not None:
+                # 应用垂直腐蚀（如果启用）- 对最终选择的mask进行腐蚀
+                mask_vis_eroded = mask_vis
+                if mask_vis is not None and self.erode_bbox:
+                    mask_vis_eroded = self.erode_mask_vertical(mask_vis.copy())
+                
+                # 计算2D质心（用于后续3D转换）
+                centroid_2d = None
+                if mask_vis_eroded is not None:
                     try:
-                        # 计算掩码的质心
-                        ys, xs = np.where(mask_vis > 0)
+                        # 计算掩码的质心（使用腐蚀后的mask）
+                        ys, xs = np.where(mask_vis_eroded > 0)
                         if ys.size > 0 and xs.size > 0:
                             centroid_x = int(np.mean(xs))
                             centroid_y = int(np.mean(ys))
-                            
-                            # 绘制十字标记
-                            cross_size = 25
-                            cross_thickness = 4
-                            cross_color = (0, 255, 255)  # 黄色 (BGR)
-                            
-                            # 水平线
-                            cv2.line(landmark_vis, 
-                                   (centroid_x - cross_size, centroid_y), 
-                                   (centroid_x + cross_size, centroid_y), 
-                                   cross_color, cross_thickness)
-                            # 垂直线
-                            cv2.line(landmark_vis, 
-                                   (centroid_x, centroid_y - cross_size), 
-                                   (centroid_x, centroid_y + cross_size), 
-                                   cross_color, cross_thickness)
+                            centroid_2d = (centroid_x, centroid_y)
+                    except Exception as e:
+                        print(f"[计算] 计算2D质心失败: {e}")
+                
+                # 在landmark_vis上绘制质心十字标记
+                if landmark_vis is not None and centroid_2d is not None:
+                    try:
+                        centroid_x, centroid_y = centroid_2d
+                        # 绘制十字标记
+                        cross_size = 25
+                        cross_thickness = 4
+                        cross_color = (0, 255, 255)  # 黄色 (BGR)
+                        
+                        # 水平线
+                        cv2.line(landmark_vis, 
+                               (centroid_x - cross_size, centroid_y), 
+                               (centroid_x + cross_size, centroid_y), 
+                               cross_color, cross_thickness)
+                        # 垂直线
+                        cv2.line(landmark_vis, 
+                               (centroid_x, centroid_y - cross_size), 
+                               (centroid_x, centroid_y + cross_size), 
+                               cross_color, cross_thickness)
                     except Exception as e:
                         print(f"[可视化] 绘制质心标记失败: {e}")
                 
@@ -965,9 +1144,10 @@ class RealtimeSegmentation3D:
                     self.fish_tracker.export_data()
 
                 # 根据掩码生成3D点云并保存（可选应用手眼标定）
+                # 注意：现在主要用于可视化，3D质心计算改为使用2D质心+深度
                 points_gripper = None  # 初始化变量
                 if mask_vis is not None and base_name is not None:
-                    # 点云生成计时
+                    # 点云生成计时（仅用于可视化，不用于质心计算）
                     pointcloud_start = time.time()
                     mask_bool = (mask_vis > 0)
                     points, colors = self.generate_pointcloud(color_image, depth_image, mask_bool)
@@ -979,19 +1159,19 @@ class RealtimeSegmentation3D:
                         points_gripper = self.apply_hand_eye_transform(points)
                         
                         # 保存点云（仅在debug模式下）
-                        if self.debug:
-                            # 保存相机坐标系点云
-                            # cam_ply = os.path.join(self.pointcloud_dir, f"{base_name}_cam_pointcloud.ply")
-                            # save_pointcloud_to_file(points, colors, cam_ply)
-                            # 保存夹爪坐标系点云
-                            grip_ply = os.path.join(self.pointcloud_dir, f"{base_name}_gripper_pointcloud.ply")
-                            save_pointcloud_to_file(points_gripper, colors, grip_ply)
+                        # if self.debug:
+                        #     # 保存相机坐标系点云
+                        #     # cam_ply = os.path.join(self.pointcloud_dir, f"{base_name}_cam_pointcloud.ply")
+                        #     # save_pointcloud_to_file(points, colors, cam_ply)
+                        #     # 保存夹爪坐标系点云
+                        #     grip_ply = os.path.join(self.pointcloud_dir, f"{base_name}_gripper_pointcloud.ply")
+                        #     save_pointcloud_to_file(points_gripper, colors, grip_ply)
                 
                 # don't forget to transform the units, the point cloud is in meter, but robot
                 # control would like to be in mm. 
 
-                # 计算点云质心和法向量（在夹爪坐标系中）
-                if points_gripper is not None and len(points_gripper) > 0:
+                # 使用2D质心+深度计算3D质心（在夹爪坐标系中）
+                if centroid_2d is not None and mask_vis is not None:
                     # 抓取点计算计时
                     grasp_calc_start = time.time()
                     
@@ -1115,47 +1295,56 @@ class RealtimeSegmentation3D:
                         except Exception as e:
                             print(f"[AI] 预测身体中心失败，回退质心: {e}")
 
-                    # 若AI未生成移动，使用质心点云方案
+                    # 若AI未生成移动，使用2D质心+深度方案
                     if relative_move is None:
-                        # 质心点（夹爪系）
-                        centroid = np.mean(points_gripper, axis=0)
-                        print(f"夹爪坐标系点云质心: {centroid}")
-                        
-                        # 将质心沿着主方向移动5mm
                         try:
-                            if len(points_gripper) > 10:
-                                # 使用点云在XY平面的投影计算主方向
-                                points_xy = points_gripper[:, :2]  # 只取XY坐标（米）
-                                points_centered = points_xy - points_xy.mean(axis=0)
+                            # 获取2D质心位置的深度值
+                            centroid_x, centroid_y = centroid_2d
+                            
+                            # 确保坐标在图像范围内
+                            h, w = depth_image.shape
+                            centroid_x = max(0, min(w - 1, centroid_x))
+                            centroid_y = max(0, min(h - 1, centroid_y))
+                            
+                            # 获取深度值（毫米）
+                            depth_mm = depth_image[int(centroid_y), int(centroid_x)]
+                            
+                            if depth_mm > 0:
+                                # 将2D质心+深度转换为3D相机坐标
+                                centroid_camera = self.pixel_to_3d_camera(centroid_x, centroid_y, depth_mm)
+                                print(f"2D质心: ({centroid_x}, {centroid_y}), 深度: {depth_mm:.1f}mm")
+                                print(f"相机坐标系3D质心: {centroid_camera}")
                                 
-                                # SVD计算主方向
-                                U, S, Vt = np.linalg.svd(points_centered, full_matrices=False)
-                                dir_xy = Vt[0, :]  # 主方向向量 (dx, dy)，单位向量
+                                # 应用手眼标定转换到夹爪坐标系
+                                # 需要将单个点转换为点数组格式
+                                centroid_camera_array = centroid_camera.reshape(1, 3)
+                                centroid_gripper_array = self.apply_hand_eye_transform(centroid_camera_array)
+                                centroid_gripper = centroid_gripper_array[0]  # 提取单个点
                                 
-                                # 确保方向一致性：选择指向正X方向的方向
-                                if dir_xy[0] < 0:
-                                    dir_xy = -dir_xy
+                                print(f"夹爪坐标系3D质心: {centroid_gripper}")
                                 
-                                # 将质心沿着主方向移动5mm（0.005米）
-                                offset_m = 0.00 # 5mm
-                                centroid_offset = centroid.copy()
-                                centroid_offset[0] += dir_xy[0] * offset_m
-                                centroid_offset[1] += dir_xy[1] * offset_m
-                                # Z坐标保持不变
-                                
-                                print(f"📐 主方向向量: ({dir_xy[0]:.4f}, {dir_xy[1]:.4f})")
-                                print(f"📍 移动前质心: {centroid}")
-                                print(f"📍 移动后质心（沿主方向+5mm）: {centroid_offset}")
-                                
-                                center_gripper_mm = centroid_offset * 1000
+                                # 转换为毫米
+                                center_gripper_mm = centroid_gripper * 1000.0
                             else:
-                                # 如果点云太少，使用原始质心
-                                print("⚠️ 点云点数太少，使用原始质心")
-                                center_gripper_mm = centroid * 1000
+                                print(f"⚠️ 警告: 2D质心位置深度值为0，无法计算3D质心")
+                                # 如果深度无效，回退到点云质心（如果可用）
+                                if points_gripper is not None and len(points_gripper) > 0:
+                                    centroid = np.mean(points_gripper, axis=0)
+                                    print(f"回退到点云质心: {centroid}")
+                                    center_gripper_mm = centroid * 1000.0
+                                else:
+                                    print("⚠️ 错误: 无法计算3D质心，跳过此目标")
+                                    continue
                         except Exception as e:
-                            # 如果计算失败，使用原始质心
-                            print(f"⚠️ 计算主方向失败: {e}，使用原始质心")
-                            center_gripper_mm = centroid * 1000
+                            print(f"⚠️ 计算2D质心到3D转换失败: {e}")
+                            # 如果转换失败，回退到点云质心（如果可用）
+                            if points_gripper is not None and len(points_gripper) > 0:
+                                centroid = np.mean(points_gripper, axis=0)
+                                print(f"回退到点云质心: {centroid}")
+                                center_gripper_mm = centroid * 1000.0
+                            else:
+                                print("⚠️ 错误: 无法计算3D质心，跳过此目标")
+                                continue
                         
                         delta_tool_mm = [center_gripper_mm[0], center_gripper_mm[1], center_gripper_mm[2]]
                         delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
@@ -1350,6 +1539,12 @@ def main():
                       help='手眼标定JSON文件路径，包含 hand_eye.R 和 hand_eye.t')
     parser.add_argument('--robot_config', type=str, default='configs/robot.json',
                       help='机器人配置文件，包含初始位姿 (默认: configs/robot.json)')
+    parser.add_argument('--erode_bbox', action='store_true',
+                      help='对检测到的mask进行上下方向腐蚀，去除边界区域以获得更精确的质心计算')
+    parser.add_argument('--erode_ratio', type=float, default=0.1,
+                      help='腐蚀比例，上下各腐蚀的比例（默认0.1，即10%%）')
+    parser.add_argument('--bbox_scale', type=float, default=1.0,
+                      help='边界框缩放因子（默认1.0，即不缩放；>1.0放大，<1.0缩小）')
     
     args = parser.parse_args()
     
@@ -1371,7 +1566,10 @@ def main():
             max_container_weight=args.max_container_weight,
             det_gray=args.det_gray,
             camera_calib_json=args.camera_calib_json,
-            robot_config=args.robot_config
+            robot_config=args.robot_config,
+            erode_bbox=args.erode_bbox,
+            erode_ratio=args.erode_ratio,
+            bbox_scale=args.bbox_scale
         )
         # 运行实时处理
         processor.run_realtime(
