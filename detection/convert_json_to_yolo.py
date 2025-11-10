@@ -23,7 +23,7 @@
 
 用法：
   python train/convert_json_to_yolo.py \
-    --source ./data \
+    --source ./data/ \
     --images_subdir images \
     --labels_out ./datasets/yolo_dataset/labels \
     --images_out ./datasets/yolo_dataset/images \

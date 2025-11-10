@@ -9,9 +9,9 @@ Ultralytics YOLO 训练脚本
 
 示例：
   python3 detection/train_yolo.py \
-    --data ./datasets/l0_11.05_yolo/dataset.yaml \
+    --data ./datasets/l0_11.04_yolo/dataset.yaml \
     --model yolov8s.pt \
-    --epochs 400 \
+    --epochs 300 \
     --batch 30 \
     --imgsz 640 \
     --project runs/train \
