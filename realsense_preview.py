@@ -18,6 +18,8 @@ import time
 import numpy as np
 import cv2
 import pyrealsense2 as rs
+import os
+from datetime import datetime
 
 def setup_realsense(width=640, height=480, depth_width=640, depth_height=480, fps=30, disable_auto_white_balance=True, manual_white_balance=4600):
     """设置RealSense相机配置（带回退策略）"""
@@ -261,6 +263,21 @@ def main():
             if key == ord('q'):
                 print("\n用户按 'q' 键退出")
                 break
+            elif key == ord('p'):
+                try:
+                    # 创建保存目录
+                    save_dir = "/home/ai/AI_perception/realtime_output/preview"
+                    os.makedirs(save_dir, exist_ok=True)
+                    # 生成时间戳文件名
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+                    base = f"frame_{frame_count:06d}_{ts}"
+                    # 保存RGB图
+                    rgb_path = os.path.join(save_dir, f"{base}_rgb.png")
+                    cv2.imwrite(rgb_path, color_image_bgr)
+                    print(f"[保存] 已保存帧到 {save_dir}:")
+                    print(f"       {os.path.basename(rgb_path)}")
+                except Exception as e:
+                    print(f"[保存] 保存帧失败: {e}")
                 
     except KeyboardInterrupt:
         print("\n用户中断")

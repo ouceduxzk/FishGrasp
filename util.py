@@ -536,6 +536,7 @@ def calculate_fish_grasp_point(mask_bool: np.ndarray, vx: float, vy: float, cent
     
     # Recalculate PCA for the tail part only to get tail's principal axis
     tail_centroid = tail_pts.mean(axis=0)
+    tail_cx, tail_cy = tail_centroid[0], tail_centroid[1]  # For debug visualization
     tail_pts_centered = tail_pts - tail_centroid
     
     U_tail, S_tail, Vt_tail = np.linalg.svd(tail_pts_centered, full_matrices=False)
@@ -696,6 +697,19 @@ def calculate_fish_grasp_point(mask_bool: np.ndarray, vx: float, vy: float, cent
             # Use the average of both calculations for accuracy
             grasp_point = (point_from_border + point_from_avg_axis) / 2.0
     
+    # Move the intersection point 20% of the whole fish principal axis length toward head
+    # Calculate the whole fish principal axis length (from head to tail)
+    # Project all points onto the first principal axis to find the extent
+    pts_centered = pts - np.array([cx, cy])
+    projections = pts_centered @ np.array([vx, vy])
+    principal_axis_length = projections.max() - projections.min()
+    
+    if principal_axis_length > 1e-6:
+        # Direction: along the first principal axis, pointing toward head (opposite of vx, vy)
+        # Move 20% of the principal axis length in the head direction
+        move_distance = principal_axis_length * 0.05
+        grasp_point = grasp_point + np.array([-vx, -vy]) * move_distance
+    
     # Debug visualization
     if debug and debug_output_path:
         try:
@@ -770,8 +784,8 @@ def calculate_fish_grasp_point(mask_bool: np.ndarray, vx: float, vy: float, cent
             cv2.line(debug_vis, (gx - cross_size, gy), (gx + cross_size, gy), (255, 255, 255), 2)  # White horizontal line
             cv2.line(debug_vis, (gx, gy - cross_size), (gx, gy + cross_size), (255, 255, 255), 2)  # White vertical line
             
-            # Draw a line from tail centroid to grasp point (along tail principal axis)
-            cv2.line(debug_vis, (int(tail_cx), int(tail_cy)), (gx, gy), (0, 255, 255), 1)  # Yellow line
+            # Draw a line from head centroid to grasp point (showing the 10% offset direction)
+            cv2.line(debug_vis, (int(head_cx), int(head_cy)), (gx, gy), (255, 255, 0), 1)  # Cyan line showing head direction
             
             # Add text label
             cv2.putText(debug_vis, "Grasp Point", (gx + 20, gy - 10), 

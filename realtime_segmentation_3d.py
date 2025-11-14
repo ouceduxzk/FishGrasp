@@ -382,6 +382,9 @@ class RealtimeSegmentation3D:
 
         image_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
         
+        # 初始化变量，用于SAM分割
+        image_rgb_for_sam = image_rgb  # 默认使用原始图像
+        
         # 根据分割模型类型选择不同的处理方式
         if self.seg_model == "yolov8_seg":
             # 使用YOLOv8分割模型
@@ -401,8 +404,31 @@ class RealtimeSegmentation3D:
                 print(f"[分割] YOLOv8分割失败: {e}")
                 return None, None
         else:
-            # 使用SAM模型
-            self.sam_predictor.set_image(image_rgb)
+            # 使用SAM模型 - 在分割前进行对比度增强预处理
+            # 使用CLAHE (Contrast Limited Adaptive Histogram Equalization) 增强对比度
+            # 这有助于提高边界清晰度
+            try:
+                # 转换到LAB颜色空间，只对L通道进行CLAHE
+                lab = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2LAB)
+                l_channel, a, b = cv2.split(lab)
+                
+                # 应用CLAHE到L通道
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                l_channel_enhanced = clahe.apply(l_channel)
+                
+                # 合并通道并转换回RGB
+                lab_enhanced = cv2.merge([l_channel_enhanced, a, b])
+                image_rgb_enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2RGB)
+                
+                # 使用增强后的图像进行SAM分割
+                self.sam_predictor.set_image(image_rgb_enhanced)
+                # 保存增强后的图像引用，用于后续的predict_torch调用
+                image_rgb_for_sam = image_rgb_enhanced
+            except Exception as e:
+                print(f"[预处理] 对比度增强失败，使用原始图像: {e}")
+                # 如果预处理失败，使用原始图像
+                self.sam_predictor.set_image(image_rgb)
+                image_rgb_for_sam = image_rgb
 
         best_idx = -1
         best_depth_m = float('inf')
@@ -459,8 +485,10 @@ class RealtimeSegmentation3D:
                     continue
             else:
                 # 使用SAM分割
+                # 使用增强后的图像尺寸
+                sam_image_shape = image_rgb_for_sam.shape[:2]
                 boxes_tensor = torch.tensor([[x1, y1, x2, y2]], device=self.device)
-                transformed_boxes = self.sam_predictor.transform.apply_boxes_torch(boxes_tensor, image_rgb.shape[:2])
+                transformed_boxes = self.sam_predictor.transform.apply_boxes_torch(boxes_tensor, sam_image_shape)
 
                 try:
                     masks, scores, logits = self.sam_predictor.predict_torch(

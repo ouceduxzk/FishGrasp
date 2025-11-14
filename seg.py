@@ -33,53 +33,44 @@ def download_models():
         urllib.request.urlretrieve(sam_model_urls["vit_h"], sam_checkpoint)
         print(f"SAM模型下载完成")
 
-def init_models(device="cpu"):
+def init_models(device="cpu", seg_model="sam", yolo_seg_weights=None):
     """
     初始化模型
     
     Args:
         device: 运行设备
+        seg_model: 分割模型类型 ("sam" 或 "yolov8_seg")
+        yolo_seg_weights: YOLOv8分割模型权重路径（当seg_model="yolov8_seg"时必需）
     
     Returns:
-        sam_predictor: SAM预测器
-        grounding_dino_model: Grounding DINO模型
-        processor: Grounding DINO处理器
+        sam_predictor 或 yolo_seg_model: 分割模型
     """
-    # 下载模型
-    download_models()
-    
-    # 初始化SAM
-    print("正在加载SAM模型...")
-    sam = sam_model_registry["vit_h"](checkpoint="sam_vit_h_4b8939.pth")
-    sam.to(device=device)
-    sam_predictor = SamPredictor(sam)
-    
-    # # 初始化Grounding DINO
-    # print("正在加载Grounding DINO模型...")
-    # model_id = "IDEA-Research/grounding-dino-tiny"
-    
-    # # 检查本地模型缓存目录
-    # import os
-    # from huggingface_hub import snapshot_download
-    
-    # # 获取本地缓存路径
-    # cache_dir = os.path.expanduser("~/.cache/huggingface/hub")
-    # model_cache_path = os.path.join(cache_dir, "models--" + model_id.replace("/", "--"))
-    
-    # if os.path.exists(model_cache_path):
-    #     print(f"发现本地模型缓存: {model_cache_path}")
-    #     print("从本地加载Grounding DINO模型...")
-    #     processor = AutoProcessor.from_pretrained(model_id, local_files_only=True)
-    #     model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id, local_files_only=True).to(device)
-    # else:
-    #     print(f"本地未找到模型缓存，从网络下载: {model_id}")
-    #     print("正在下载Grounding DINO模型...")
-    #     processor = AutoProcessor.from_pretrained(model_id)
-    #     model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id).to(device)
-    
-    # print("Grounding DINO模型加载成功")
-    
-    return sam_predictor#, model, processor
+    if seg_model == "yolov8_seg":
+        # 初始化YOLOv8分割模型
+        if yolo_seg_weights is None:
+            raise ValueError("使用yolov8_seg时必须提供yolo_seg_weights参数")
+        
+        try:
+            from ultralytics import YOLO
+        except ImportError:
+            raise ImportError("未找到 ultralytics，请先安装: pip install ultralytics")
+        
+        print(f"正在加载YOLOv8分割模型: {yolo_seg_weights}")
+        yolo_seg_model = YOLO(yolo_seg_weights)
+        print("YOLOv8分割模型加载成功")
+        return yolo_seg_model
+    else:
+        # 默认使用SAM
+        # 下载模型
+        download_models()
+        
+        # 初始化SAM
+        print("正在加载SAM模型...")
+        sam = sam_model_registry["vit_h"](checkpoint="sam_vit_h_4b8939.pth")
+        sam.to(device=device)
+        sam_predictor = SamPredictor(sam)
+        print("SAM模型加载成功")
+        return sam_predictor
 
 def process_image_for_mask(sam_predictor, grounding_dino_model, processor, image, device="cpu"):
     """
