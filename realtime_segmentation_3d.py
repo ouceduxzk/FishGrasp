@@ -35,6 +35,7 @@ import json
 from seg import init_models
 from util import (
     estimate_body_angle_alpha1,
+    estimate_body_angle_and_grasp_point,
     draw_principal_axis,
     angle_between_2d_from_origin,
     apply_hand_eye_transform as util_apply_hand_eye_transform,
@@ -1245,27 +1246,59 @@ class RealtimeSegmentation3D:
                     except Exception as e:
                         print(f"[计算] 计算2D质心失败: {e}")
                 
-                # 在landmark_vis上绘制质心十字标记
-                if landmark_vis is not None and centroid_2d is not None:
+                # 在landmark_vis上绘制质心和抓取点标记
+                if landmark_vis is not None:
                     try:
-                        centroid_x, centroid_y = centroid_2d
-                        # 绘制十字标记
-                        cross_size = 25
-                        cross_thickness = 4
-                        cross_color = (0, 255, 255)  # 黄色 (BGR)
+                        # 如果使用centroid模式，尝试计算并显示抓取点
+                        grasp_point_2d_vis = None
+                        if self.grasp_point_mode == "centroid" and mask_vis is not None:
+                            try:
+                                _, _, _, grasp_point_2d_vis = estimate_body_angle_and_grasp_point(
+                                    mask_vis > 0, 
+                                    return_details=True,
+                                    debug=False,  # 预览时不保存调试图像
+                                    debug_output_path=None
+                                )
+                            except Exception as e:
+                                # 预览时计算失败不影响主流程
+                                pass
                         
-                        # 水平线
-                        cv2.line(landmark_vis, 
-                               (centroid_x - cross_size, centroid_y), 
-                               (centroid_x + cross_size, centroid_y), 
-                               cross_color, cross_thickness)
-                        # 垂直线
-                        cv2.line(landmark_vis, 
-                               (centroid_x, centroid_y - cross_size), 
-                               (centroid_x, centroid_y + cross_size), 
-                               cross_color, cross_thickness)
+                        # 绘制质心十字标记（黄色）
+                        if centroid_2d is not None:
+                            centroid_x, centroid_y = centroid_2d
+                            cross_size = 25
+                            cross_thickness = 4
+                            cross_color = (0, 255, 255)  # 黄色 (BGR)
+                            
+                            # 水平线
+                            cv2.line(landmark_vis, 
+                                   (centroid_x - cross_size, centroid_y), 
+                                   (centroid_x + cross_size, centroid_y), 
+                                   cross_color, cross_thickness)
+                            # 垂直线
+                            cv2.line(landmark_vis, 
+                                   (centroid_x, centroid_y - cross_size), 
+                                   (centroid_x, centroid_y + cross_size), 
+                                   cross_color, cross_thickness)
+                        
+                        # 绘制抓取点标记（红色，如果计算成功）
+                        if grasp_point_2d_vis is not None:
+                            grasp_x, grasp_y = int(round(grasp_point_2d_vis[0])), int(round(grasp_point_2d_vis[1]))
+                            # 绘制红色圆圈和十字
+                            cv2.circle(landmark_vis, (grasp_x, grasp_y), 8, (0, 0, 255), -1)  # 红色填充圆
+                            cv2.circle(landmark_vis, (grasp_x, grasp_y), 12, (0, 0, 255), 2)  # 红色外圈
+                            # 十字标记
+                            cross_size_grasp = 15
+                            cv2.line(landmark_vis, 
+                                   (grasp_x - cross_size_grasp, grasp_y), 
+                                   (grasp_x + cross_size_grasp, grasp_y), 
+                                   (255, 255, 255), 2)  # 白色十字
+                            cv2.line(landmark_vis, 
+                                   (grasp_x, grasp_y - cross_size_grasp), 
+                                   (grasp_x, grasp_y + cross_size_grasp), 
+                                   (255, 255, 255), 2)  # 白色十字
                     except Exception as e:
-                        print(f"[可视化] 绘制质心标记失败: {e}")
+                        print(f"[可视化] 绘制标记失败: {e}")
                 
                 # 显示预览窗口
                 self.show_preview(color_image, depth_image, mask_vis, detection_vis, landmark_vis)
@@ -1444,55 +1477,85 @@ class RealtimeSegmentation3D:
                         except Exception as e:
                             print(f"[AI] 预测身体中心失败，回退质心: {e}")
 
-                    # 若AI未生成移动，使用2D质心+深度方案
+                    # 若AI未生成移动，使用新的抓取点计算方案（基于PCA的抓取点）
                     if relative_move is None:
                         try:
-                            # 获取2D质心位置的深度值
-                            centroid_x, centroid_y = centroid_2d
+                            # 使用新的抓取点计算函数
+                            grasp_point_2d = None
+                            if mask_vis is not None:
+                                # 计算抓取点（2D像素坐标）
+                                debug_output_path = None
+                                if hasattr(self, 'debug') and self.debug:
+                                    # 生成调试输出路径
+                                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+                                    debug_output_path = os.path.join(self.output_dir, f"grasp_point_debug_{timestamp}")
+                                
+                                try:
+                                    _, _, _, grasp_point_2d = estimate_body_angle_and_grasp_point(
+                                        mask_vis > 0, 
+                                        return_details=True,
+                                        debug=hasattr(self, 'debug') and self.debug,
+                                        debug_output_path=debug_output_path
+                                    )
+                                    if grasp_point_2d is not None:
+                                        print(f"🎯 计算得到抓取点(2D): ({grasp_point_2d[0]:.1f}, {grasp_point_2d[1]:.1f})")
+                                except Exception as e:
+                                    print(f"⚠️ 计算抓取点失败: {e}")
+                            
+                            # 如果抓取点计算失败，回退到2D质心
+                            if grasp_point_2d is None:
+                                if centroid_2d is not None:
+                                    grasp_point_2d = (float(centroid_2d[0]), float(centroid_2d[1]))
+                                    print(f"⚠️ 抓取点计算失败，回退到2D质心: ({grasp_point_2d[0]:.1f}, {grasp_point_2d[1]:.1f})")
+                                else:
+                                    print("⚠️ 错误: 无法获取抓取点或质心，跳过此目标")
+                                    continue
                             
                             # 确保坐标在图像范围内
                             h, w = depth_image.shape
-                            centroid_x = max(0, min(w - 1, centroid_x))
-                            centroid_y = max(0, min(h - 1, centroid_y))
+                            grasp_x = max(0, min(w - 1, int(round(grasp_point_2d[0]))))
+                            grasp_y = max(0, min(h - 1, int(round(grasp_point_2d[1]))))
                             
                             # 获取深度值（毫米）
-                            depth_mm = depth_image[int(centroid_y), int(centroid_x)]
+                            depth_mm = depth_image[grasp_y, grasp_x]
                             
                             if depth_mm > 0:
-                                # 将2D质心+深度转换为3D相机坐标
-                                centroid_camera = self.pixel_to_3d_camera(centroid_x, centroid_y, depth_mm)
-                                print(f"2D质心: ({centroid_x}, {centroid_y}), 深度: {depth_mm:.1f}mm")
-                                print(f"相机坐标系3D质心: {centroid_camera}")
+                                # 将2D抓取点+深度转换为3D相机坐标
+                                grasp_camera = self.pixel_to_3d_camera(grasp_x, grasp_y, depth_mm)
+                                print(f"2D抓取点: ({grasp_x}, {grasp_y}), 深度: {depth_mm:.1f}mm")
+                                print(f"相机坐标系3D抓取点: {grasp_camera}")
                                 
                                 # 应用手眼标定转换到夹爪坐标系
                                 # 需要将单个点转换为点数组格式
-                                centroid_camera_array = centroid_camera.reshape(1, 3)
-                                centroid_gripper_array = self.apply_hand_eye_transform(centroid_camera_array)
-                                centroid_gripper = centroid_gripper_array[0]  # 提取单个点
+                                grasp_camera_array = grasp_camera.reshape(1, 3)
+                                grasp_gripper_array = self.apply_hand_eye_transform(grasp_camera_array)
+                                grasp_gripper = grasp_gripper_array[0]  # 提取单个点
                                 
-                                print(f"夹爪坐标系3D质心: {centroid_gripper}")
+                                print(f"夹爪坐标系3D抓取点: {grasp_gripper}")
                                 
                                 # 转换为毫米
-                                center_gripper_mm = centroid_gripper * 1000.0
+                                center_gripper_mm = grasp_gripper * 1000.0
                             else:
-                                print(f"⚠️ 警告: 2D质心位置深度值为0，无法计算3D质心")
+                                print(f"⚠️ 警告: 2D抓取点位置深度值为0，无法计算3D抓取点")
                                 # 如果深度无效，回退到点云质心（如果可用）
                                 if points_gripper is not None and len(points_gripper) > 0:
                                     centroid = np.mean(points_gripper, axis=0)
                                     print(f"回退到点云质心: {centroid}")
                                     center_gripper_mm = centroid * 1000.0
                                 else:
-                                    print("⚠️ 错误: 无法计算3D质心，跳过此目标")
+                                    print("⚠️ 错误: 无法计算3D抓取点，跳过此目标")
                                     continue
                         except Exception as e:
-                            print(f"⚠️ 计算2D质心到3D转换失败: {e}")
+                            print(f"⚠️ 计算2D抓取点到3D转换失败: {e}")
+                            import traceback
+                            traceback.print_exc()
                             # 如果转换失败，回退到点云质心（如果可用）
                             if points_gripper is not None and len(points_gripper) > 0:
                                 centroid = np.mean(points_gripper, axis=0)
                                 print(f"回退到点云质心: {centroid}")
                                 center_gripper_mm = centroid * 1000.0
                             else:
-                                print("⚠️ 错误: 无法计算3D质心，跳过此目标")
+                                print("⚠️ 错误: 无法计算3D抓取点，跳过此目标")
                                 continue
                         
                         delta_tool_mm = [center_gripper_mm[0], center_gripper_mm[1], center_gripper_mm[2]]
