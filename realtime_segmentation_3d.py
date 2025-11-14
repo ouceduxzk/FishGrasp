@@ -84,7 +84,8 @@ except ImportError:
 class RealtimeSegmentation3D:
     def __init__(self, output_dir, device="cpu", save_pointcloud=True, intrinsics_file=None, hand_eye_file=None, bbox_selection="highest_confidence", debug=False, use_yolo=False, yolo_weights=None,
                  grasp_point_mode: str = "centroid", landmark_model_path: str = None, enable_weight_tracking: bool = True, max_container_weight: float = 12.5, det_gray: bool = False,
-                 camera_calib_json: str = None, robot_config: str = "config/robot.json", erode_bbox: bool = False, erode_ratio: float = 0.1, bbox_scale: float = 1.0):
+                 camera_calib_json: str = None, robot_config: str = "config/robot.json", erode_bbox: bool = False, erode_ratio: float = 0.1, bbox_scale: float = 1.0,
+                 seg_model: str = "sam", yolo_seg_weights: str = None):
         """
         初始化实时分割和3D点云生成器
         
@@ -105,6 +106,8 @@ class RealtimeSegmentation3D:
             erode_bbox: 是否对mask进行上下方向腐蚀（用于更精确的质心计算）
             erode_ratio: 腐蚀比例，上下各腐蚀的比例（默认0.1，即10%）
             bbox_scale: 边界框缩放因子（默认1.0，即不缩放；>1.0放大，<1.0缩小）
+            seg_model: 分割模型类型 ("sam" 或 "yolov8_seg")，默认 "sam"
+            yolo_seg_weights: YOLOv8分割模型权重路径（当seg_model="yolov8_seg"时必需）
         """
         self.output_dir = output_dir
         self.device = device
@@ -127,6 +130,9 @@ class RealtimeSegmentation3D:
         # configs
         self.camera_calib_json = camera_calib_json
         self.robot_config = robot_config
+        # 分割模型相关
+        self.seg_model = seg_model
+        self.yolo_seg_weights = yolo_seg_weights
         # 创建输出目录（仅在debug模式下创建）
         if self.debug:
             self.rgb_dir = os.path.join(output_dir, "rgb")
@@ -150,7 +156,12 @@ class RealtimeSegmentation3D:
         # 初始化模型
         print("正在初始化AI模型...")
         #self.sam_predictor, self.grounding_dino_model, self.processor = init_models(device)
-        self.sam_predictor = init_models(device)
+        self.seg_predictor = init_models(device, seg_model=seg_model, yolo_seg_weights=yolo_seg_weights)
+        # 为了向后兼容，保留 sam_predictor 属性
+        if seg_model == "sam":
+            self.sam_predictor = self.seg_predictor
+        else:
+            self.sam_predictor = None  # 使用yolov8_seg时不需要sam_predictor
 
         if self.use_yolo:
             if not self.yolo_weights or not os.path.exists(self.yolo_weights):
@@ -242,7 +253,8 @@ class RealtimeSegmentation3D:
                     [ 0.09064269, -0.99579624, -0.01318166],
                     [-0.05149178, -0.01790468,  0.9985129 ]
                 ], dtype=np.float32)
-                t_default = np.array([[0.0607777], [0.09996735], [-0.18889416]], dtype=np.float32)
+                t_default = np.array([[0.0607777], [0.10496735], [-0.18889416]], dtype=np.float32)
+
                 self.hand_eye_transform = np.eye(4, dtype=np.float32)
                 self.hand_eye_transform[:3, :3] = R_default
                 self.hand_eye_transform[:3, 3:4] = t_default
@@ -353,7 +365,7 @@ class RealtimeSegmentation3D:
         detection_start = time.time()
         #if getattr(self, 'use_yolo', False):
         # YOLO 路径：detect_yolo 已返回所有满足条件的框 (x1,y1,x2,y2,conf)
-        boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.25, iou=0.45, imgsz=640, min_area=2500)
+        boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.6, iou=0.45, imgsz=640, min_area=8000)
        
         detection_time = time.time() - detection_start
         self.timers['detection'].append(detection_time)
@@ -368,35 +380,104 @@ class RealtimeSegmentation3D:
         base_name = f"frame_{self.frame_count:06d}_{timestamp}"
 
         image_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
-        self.sam_predictor.set_image(image_rgb)
+        
+        # 根据分割模型类型选择不同的处理方式
+        if self.seg_model == "yolov8_seg":
+            # 使用YOLOv8分割模型
+            # YOLOv8可以直接对整个图像进行分割，然后根据bbox提取对应的mask
+            try:
+                yolo_results = self.seg_predictor(color_image, verbose=False)
+                # 提取所有检测结果
+                all_yolo_boxes = []
+                all_yolo_masks = []
+                for result in yolo_results:
+                    if result.masks is not None:
+                        boxes_yolo = result.boxes.xyxy.cpu().numpy()
+                        masks_yolo = result.masks.data.cpu().numpy()
+                        all_yolo_boxes.extend(boxes_yolo)
+                        all_yolo_masks.extend(masks_yolo)
+            except Exception as e:
+                print(f"[分割] YOLOv8分割失败: {e}")
+                return None, None
+        else:
+            # 使用SAM模型
+            self.sam_predictor.set_image(image_rgb)
 
         best_idx = -1
         best_depth_m = float('inf')
         best_mask = None
+        best_confidence = -1.0  # For highest_confidence selection
 
         segmentation_start = time.time()
         for i, b in enumerate(boxes):
             x1, y1, x2, y2 = b[:4]
-            boxes_tensor = torch.tensor([[x1, y1, x2, y2]], device=self.device)
-            transformed_boxes = self.sam_predictor.transform.apply_boxes_torch(boxes_tensor, image_rgb.shape[:2])
+            confidence = b[4] if len(b) > 4 else 0.0  # Get confidence from bbox
+            
+            if self.seg_model == "yolov8_seg":
+                # 使用YOLOv8分割
+                try:
+                    # 从YOLOv8结果中找到与当前bbox最匹配的检测
+                    mask_np = None
+                    best_iou = 0.0
+                    best_mask_idx = -1
+                    
+                    for j, (box_yolo, mask_yolo) in enumerate(zip(all_yolo_boxes, all_yolo_masks)):
+                        # 计算IoU
+                        box_yolo_x1, box_yolo_y1, box_yolo_x2, box_yolo_y2 = box_yolo
+                        intersection_x1 = max(x1, box_yolo_x1)
+                        intersection_y1 = max(y1, box_yolo_y1)
+                        intersection_x2 = min(x2, box_yolo_x2)
+                        intersection_y2 = min(y2, box_yolo_y2)
+                        
+                        if intersection_x2 > intersection_x1 and intersection_y2 > intersection_y1:
+                            intersection_area = (intersection_x2 - intersection_x1) * (intersection_y2 - intersection_y1)
+                            box_area = (x2 - x1) * (y2 - y1)
+                            box_yolo_area = (box_yolo_x2 - box_yolo_x1) * (box_yolo_y2 - box_yolo_y1)
+                            union_area = box_area + box_yolo_area - intersection_area
+                            iou = intersection_area / union_area if union_area > 0 else 0.0
+                            
+                            if iou > best_iou and iou > 0.3:  # 阈值0.3
+                                best_iou = iou
+                                best_mask_idx = j
+                    
+                    if best_mask_idx >= 0:
+                        # 将mask转换为uint8格式，并调整到图像尺寸
+                        mask_yolo = all_yolo_masks[best_mask_idx]
+                        h, w = color_image.shape[:2]
+                        if mask_yolo.shape != (h, w):
+                            # 如果mask尺寸不匹配，需要调整
+                            mask_yolo = cv2.resize(mask_yolo, (w, h), interpolation=cv2.INTER_NEAREST)
+                        mask_np = (mask_yolo * 255).astype(np.uint8)
+                    else:
+                        print(f"[分割] 候选框 {i} 未找到匹配的YOLOv8分割结果 (IoU阈值: 0.3)")
+                        continue
+                except Exception as e:
+                    print(f"[分割] 候选框 {i} YOLOv8分割失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+            else:
+                # 使用SAM分割
+                boxes_tensor = torch.tensor([[x1, y1, x2, y2]], device=self.device)
+                transformed_boxes = self.sam_predictor.transform.apply_boxes_torch(boxes_tensor, image_rgb.shape[:2])
 
-            try:
-                masks, scores, logits = self.sam_predictor.predict_torch(
-                    point_coords=None,
-                    point_labels=None,
-                    boxes=transformed_boxes,
-                    multimask_output=False
-                )
-            except Exception as e:
-                print(f"[分割] 候选框 {i} 预测失败: {e}")
-                continue
+                try:
+                    masks, scores, logits = self.sam_predictor.predict_torch(
+                        point_coords=None,
+                        point_labels=None,
+                        boxes=transformed_boxes,
+                        multimask_output=False
+                    )
+                except Exception as e:
+                    print(f"[分割] 候选框 {i} 预测失败: {e}")
+                    continue
 
-            if masks.shape[0] == 0 or masks.shape[1] == 0:
-                print(f"[分割] 候选框 {i} 未生成掩码")
-                continue
+                if masks.shape[0] == 0 or masks.shape[1] == 0:
+                    print(f"[分割] 候选框 {i} 未生成掩码")
+                    continue
 
-            m_bool = masks[0][0].detach().cpu().numpy().astype(np.uint8)
-            mask_np = m_bool * 255
+                m_bool = masks[0][0].detach().cpu().numpy().astype(np.uint8)
+                mask_np = m_bool * 255
             # 限制在 bbox 内
             restricted_mask = np.zeros_like(mask_np, dtype=np.uint8)
             restricted_mask[y1:y2, x1:x2] = mask_np[y1:y2, x1:x2]
@@ -462,10 +543,30 @@ class RealtimeSegmentation3D:
                 cv2.putText(det_vis, f"cand {i}", (x1, max(0, y1-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
                 cv2.imwrite(os.path.join(self.detection_dir, f"{base_name}_cand{i}_box.png"), det_vis)
 
-            if depth_m < best_depth_m:
+            # Select best bbox based on bbox_selection strategy
+            should_update = False
+            if self.bbox_selection == "highest_confidence":
+                # Select bbox with highest confidence
+                if confidence > best_confidence:
+                    should_update = True
+            elif self.bbox_selection == "smallest":
+                # Select bbox with smallest area (closest depth)
+                if depth_m < best_depth_m:
+                    should_update = True
+            elif self.bbox_selection == "largest":
+                # Select bbox with largest area (farthest depth)
+                if depth_m > best_depth_m:
+                    should_update = True
+            else:
+                # Default: smallest depth (closest)
+                if depth_m < best_depth_m:
+                    should_update = True
+            
+            if should_update:
                 best_depth_m = depth_m
                 best_mask = mask_np
                 best_idx = i
+                best_confidence = confidence
 
         segmentation_time = time.time() - segmentation_start
         self.timers['segmentation'].append(segmentation_time)
@@ -474,8 +575,15 @@ class RealtimeSegmentation3D:
         if best_idx == -1 or best_mask is None:
             print("分割/点云均失败，未选出候选")
             return None, None
-
-        print(f"选择最近候选: idx={best_idx}, 深度={best_depth_m:.4f} m")
+        
+        if self.bbox_selection == "highest_confidence":
+            print(f"选择最高置信度候选: idx={best_idx}, 置信度={best_confidence:.3f}, 深度={best_depth_m:.4f} m")
+        elif self.bbox_selection == "smallest":
+            print(f"选择最近候选: idx={best_idx}, 深度={best_depth_m:.4f} m")
+        elif self.bbox_selection == "largest":
+            print(f"选择最远候选: idx={best_idx}, 深度={best_depth_m:.4f} m")
+        else:
+            print(f"选择最近候选: idx={best_idx}, 深度={best_depth_m:.4f} m")
 
         if best_depth_m > 0.8:
             print(f"深度超过0.8m，跳过")
@@ -866,10 +974,14 @@ class RealtimeSegmentation3D:
         """
         print("开始实时处理...")
         print("按 'q' 键停止")
+        print("按空格键暂停/继续")
         if self.fish_tracker is not None:
             print("按 'r' 键重置容器")
             print("按 's' 键显示状态")
             print("按 'e' 键导出数据")
+        
+        # 暂停标志
+        paused = False
         
         # 验证相机连接
         print("[调试] 开始验证相机连接...")
@@ -911,13 +1023,17 @@ class RealtimeSegmentation3D:
 
         try:
             tcp_result = self.robot.get_tcp_position()
+            joint_result = self.robot.get_joint_position()
+            original_joint = []
             if isinstance(tcp_result, tuple) and len(tcp_result) == 2:
                 tcp_ok, original_tcp = tcp_result
+                original_joint =  joint_result[1]
             else:
                 # 如果只返回一个值，假设它是位置信息
                 original_tcp = tcp_result
                 tcp_ok = True
             print(f"[调试] TCP位置获取成功: {original_tcp}")
+            print(f"[调试] Joint位置获取成功: {original_joint}")
         except Exception as e:
             print(f"[错误] 获取TCP位置失败: {e}")
             import traceback
@@ -985,6 +1101,32 @@ class RealtimeSegmentation3D:
             
         try:
             while True:
+                # 处理键盘输入（包括暂停状态下的输入）
+                if show_preview:
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord(' '):  # 空格键
+                        paused = not paused
+                        if paused:
+                            print("⏸️  已暂停 - 按空格键继续")
+                        else:
+                            print("▶️  已继续")
+                    elif key == ord('q'):
+                        print("用户按 'q' 键停止")
+                        break
+                    elif key == ord('r') and self.fish_tracker is not None:
+                        print("用户按 'r' 键重置容器")
+                        self.fish_tracker.reset_container(confirm=True)
+                    elif key == ord('s') and self.fish_tracker is not None:
+                        print("用户按 's' 键显示状态")
+                        self.fish_tracker.print_status()
+                    elif key == ord('e') and self.fish_tracker is not None:
+                        print("用户按 'e' 键导出数据")
+                        self.fish_tracker.export_data()
+                
+                # 如果暂停，跳过处理但继续监听键盘
+                if paused:
+                    continue
+                
                 # 整个循环计时开始
                 cycle_start = time.time()
                 
@@ -1033,7 +1175,7 @@ class RealtimeSegmentation3D:
                 if mask_vis is not None:
                     # 重新运行检测以获取边界框可视化
                     #if getattr(self, 'use_yolo', False):
-                    boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.25, iou=0.45, imgsz=640)
+                    boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.6, iou=0.45, imgsz=640)
                   
                     if boxes:
                         detection_vis = color_image.copy()
@@ -1128,20 +1270,27 @@ class RealtimeSegmentation3D:
                 # 显示预览窗口
                 self.show_preview(color_image, depth_image, mask_vis, detection_vis, landmark_vis)
                 
-                # 确保窗口显示并处理按键
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    print("用户按 'q' 键停止")
-                    break
-                elif key == ord('r') and self.fish_tracker is not None:
-                    print("用户按 'r' 键重置容器")
-                    self.fish_tracker.reset_container(confirm=True)
-                elif key == ord('s') and self.fish_tracker is not None:
-                    print("用户按 's' 键显示状态")
-                    self.fish_tracker.print_status()
-                elif key == ord('e') and self.fish_tracker is not None:
-                    print("用户按 'e' 键导出数据")
-                    self.fish_tracker.export_data()
+                # 确保窗口显示并处理按键（非暂停状态下的额外按键处理）
+                if show_preview:
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord(' '):  # 空格键
+                        paused = not paused
+                        if paused:
+                            print("⏸️  已暂停 - 按空格键继续")
+                        else:
+                            print("▶️  已继续")
+                    elif key == ord('q'):
+                        print("用户按 'q' 键停止")
+                        break
+                    elif key == ord('r') and self.fish_tracker is not None:
+                        print("用户按 'r' 键重置容器")
+                        self.fish_tracker.reset_container(confirm=True)
+                    elif key == ord('s') and self.fish_tracker is not None:
+                        print("用户按 's' 键显示状态")
+                        self.fish_tracker.print_status()
+                    elif key == ord('e') and self.fish_tracker is not None:
+                        print("用户按 'e' 键导出数据")
+                        self.fish_tracker.export_data()
 
                 # 根据掩码生成3D点云并保存（可选应用手眼标定）
                 # 注意：现在主要用于可视化，3D质心计算改为使用2D质心+深度
@@ -1349,7 +1498,7 @@ class RealtimeSegmentation3D:
                         delta_tool_mm = [center_gripper_mm[0], center_gripper_mm[1], center_gripper_mm[2]]
                         delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
                         z_offset = -delta_tool_mm[2]
-                        relative_move = [delta_base_xyz[0], delta_base_xyz[1], z_offset, 0, 0, 0]
+                        relative_move = [delta_base_xyz[0], delta_base_xyz[1], z_offset -5, 0, 0, 0]
                         
                         # 在质心模式下，确保alpha_1的方向一致性
                         # PCA可能返回两个相反的方向，导致角度不一致（有时旋转90度）
@@ -1389,6 +1538,23 @@ class RealtimeSegmentation3D:
                     self.timers['grasp_calculation'].append(grasp_calc_time)
                     print(f"⏱️  grasp_calculation: {grasp_calc_time:.3f}s")
                     
+
+                    # 执行相对移动
+                    fish_count += 1
+                    counter = rows * cols
+                    if counter <= 0:
+                        print(f"[错误] 无效的网格配置: rows={rows}, cols={cols}, counter={counter}")
+                        counter = len(fish_path_json) if fish_path_json else 1
+                        print(f"[警告] 使用路径文件数量作为计数器: {counter}")
+                    fish_count = ((fish_count - 1) % counter) + 1  # 确保 fish_count 在 1 到 counter 之间
+                    print(f"[调试] fish_count={fish_count}, counter={counter}, rows={rows}, cols={cols}")
+
+                    if fish_count == 1:
+                        continue
+
+                    if fish_count == 6:
+                        continue
+
                     print("Step1 : 准备抓取")
                     print("相对移动量:", relative_move)
                     
@@ -1406,24 +1572,29 @@ class RealtimeSegmentation3D:
                     self.robot.joint_move([0,0,0,0,0,np.pi/2-alpha_1], 1, True, 1)
                     time.sleep(0.5)
                     
-                    # 执行相对移动
-                    fish_count += 1
-                    counter = rows * cols
-                    if counter <= 0:
-                        print(f"[错误] 无效的网格配置: rows={rows}, cols={cols}, counter={counter}")
-                        counter = len(fish_path_json) if fish_path_json else 1
-                        print(f"[警告] 使用路径文件数量作为计数器: {counter}")
-                    fish_count = ((fish_count - 1) % counter) + 1  # 确保 fish_count 在 1 到 counter 之间
-                    print(f"[调试] fish_count={fish_count}, counter={counter}, rows={rows}, cols={cols}")
-
-                    self.robot.set_digital_output(0, 0, 1)
-
                     # catch fish
                     ret = self.robot.linear_move([relative_move[0], relative_move[1], 0, 0, 0, 0], 1, True, 100)
+                    self.robot.set_digital_output(0, 0, 1)
+
                     ret = self.robot.linear_move([0, 0, relative_move[2], 0, 0, 0], 1, True, 100)
+
+                    if fish_count == 5 or fish_count == 10:
+                        relative_move[1] = float(relative_move[1]-50)
+
+                    time.sleep(0.3)
                   
+                    #ret = self.robot.linear_move(original_tcp, 0, True, 100)
+
                     # go back to original point
-                    self.robot.linear_move(original_tcp, 0 , True, 40)
+                    #self.robot.joint_move([0,0,0,0,0,-np.pi/2+alpha_1], 1, True, 1)
+                    ret = self.robot.linear_move(original_tcp, 0, True, 100)
+
+                    rotation_flag = 1 if alpha_1_raw > 0 else -1 
+                    print("-----------------------------------------------------------")
+                    print("rotation_flag : {}".format(rotation_flag))
+                    ret = self.robot.joint_move([0,0,0,0,0,-np.pi/2 * rotation_flag],1, False,50)
+
+                    time.sleep(0.2)
                     
                     # get target point1
                     fish_key = str(fish_count)
@@ -1455,9 +1626,9 @@ class RealtimeSegmentation3D:
                     self.robot.set_digital_output(0,1,0)
                     ret = self.robot.linear_move([0, -joint_pos2[1], 200, 0, 0, 0], 1 , True, 400)
                     
-                    self.robot.linear_move(original_tcp, 0 , True, 200)
+                    self.robot.linear_move(original_tcp, 0, True, 200)
                     
-                    time.sleep(1)
+                    time.sleep(0.3)
                     
                     robot_movement_time = time.time() - robot_movement_start
                     self.timers['robot_movement'].append(robot_movement_time)
@@ -1545,6 +1716,11 @@ def main():
                       help='腐蚀比例，上下各腐蚀的比例（默认0.1，即10%%）')
     parser.add_argument('--bbox_scale', type=float, default=1.0,
                       help='边界框缩放因子（默认1.0，即不缩放；>1.0放大，<1.0缩小）')
+    parser.add_argument('--seg_model', type=str, default='sam',
+                      choices=['sam', 'yolov8_seg'],
+                      help='分割模型类型: sam(默认) 或 yolov8_seg')
+    parser.add_argument('--yolo_seg_weights', type=str, default=None,
+                      help='YOLOv8分割模型权重路径(.pt)，当 --seg_model=yolov8_seg 时必需')
     
     args = parser.parse_args()
     
@@ -1569,7 +1745,9 @@ def main():
             robot_config=args.robot_config,
             erode_bbox=args.erode_bbox,
             erode_ratio=args.erode_ratio,
-            bbox_scale=args.bbox_scale
+            bbox_scale=args.bbox_scale,
+            seg_model=args.seg_model,
+            yolo_seg_weights=args.yolo_seg_weights
         )
         # 运行实时处理
         processor.run_realtime(
