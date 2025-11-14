@@ -47,9 +47,12 @@ ret = robot.joint_move([-204.939*np.pi/180,
                         -62.559*np.pi/180, 
                         53.687*np.pi/180,
                         -269.533*np.pi/180, 
-                        -203.005*np.pi/180], 0, False, 0.5)
+                        -203.005*np.pi/180], 0, False, 0.25)
 
 time.sleep(1)
+
+ret = robot.get_sdk_version()
+print("SDK version  is:",ret[1])
 
 #robot.set_digital_output(0, 0, 1)
 #time.sleep(10)
@@ -111,7 +114,8 @@ time.sleep(1)
 #                        -203.005*np.pi/180], 0, False, 1)
 #
 #   time.sleep(1)
-#
+#before:x=-308.461 y=15.709 
+#after:x=-401.382 y=-271.485
 #   print("times:",n)
 
 robot.logout()

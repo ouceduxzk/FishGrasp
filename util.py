@@ -4,9 +4,814 @@ import cv2
 from typing import Tuple, Optional
 
 
-def estimate_body_angle_alpha1(mask_bool: np.ndarray, return_details: bool = False):
+def detect_tail_direction(mask_bool: np.ndarray, vx: float, vy: float, centroid: Tuple[float, float], 
+                          debug: bool = False, debug_output_path: Optional[str] = None) -> bool:
+    """
+    Detect which direction along the principal axis points to the tail.
+    
+    Strategy: Divide mask into two halves along the SECOND principal axis (perpendicular to main axis),
+    and check which half is more uniform/rectangular (tail is more uniform).
+    
+    Args:
+        mask_bool: HxW boolean array; True indicates body pixels
+        vx, vy: First principal direction vector (unit vector) - main body axis
+        centroid: (cx, cy) centroid of the mask
+        debug: If True, save debug visualizations
+        debug_output_path: Path prefix for debug output files (e.g., "debug_mask_001")
+    
+    Returns:
+        True if (vx, vy) points to tail, False if (-vx, -vy) points to tail
+    """
+    ys, xs = np.where(mask_bool)
+    if ys.size < 20:
+        return True  # Default: assume current direction is correct
+    
+    cx, cy = centroid
+    
+    # Get all points
+    pts = np.stack([xs.astype(np.float64), ys.astype(np.float64)], axis=1)
+    pts_centered = pts - np.array([cx, cy])
+    
+    # Compute PCA to get principal directions for the whole fish
+    U, S, Vt = np.linalg.svd(pts_centered, full_matrices=False)
+    if Vt.shape[0] < 2:
+        return True  # Cannot compute principal directions
+    
+    # First principal direction (main body axis) - should match (vx, vy)
+    dir1 = Vt[0]
+    # Second principal direction (perpendicular to first)
+    dir2 = Vt[1]
+    
+    # Normalize second principal direction
+    norm2 = math.hypot(dir2[0], dir2[1]) or 1.0
+    v2x = dir2[0] / norm2
+    v2y = dir2[1] / norm2
+    
+    # Rotate all points to align with principal axis
+    angle = math.atan2(dir1[1], dir1[0])
+    cos_a, sin_a = math.cos(-angle), math.sin(-angle)
+    R = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+    pts_rotated = (R @ pts_centered.T).T
+    
+    # Fit axis-aligned rectangle (min bounding box) for the whole fish
+    x_min, x_max = pts_rotated[:, 0].min(), pts_rotated[:, 0].max()
+    y_min, y_max = pts_rotated[:, 1].min(), pts_rotated[:, 1].max()
+    
+    # Split the rectangle into two halves along the first principal axis (x-axis in rotated space)
+    x_mid = (x_min + x_max) / 2.0
+    
+    # Split points into two halves based on their x-coordinate in rotated space
+    half1_mask_rotated = pts_rotated[:, 0] < x_mid
+    half2_mask_rotated = pts_rotated[:, 0] >= x_mid
+    
+    if half1_mask_rotated.sum() < 10 or half2_mask_rotated.sum() < 10:
+        return True  # Not enough points, use default
+    
+    # Get points for each half (in original space)
+    half1_pts = pts[half1_mask_rotated]
+    half2_pts = pts[half2_mask_rotated]
+    
+    # Create boolean masks for each half
+    h, w = mask_bool.shape
+    half1_mask_bool = np.zeros_like(mask_bool)
+    half2_mask_bool = np.zeros_like(mask_bool)
+    for i, pt in enumerate(pts):
+        x, y = int(pt[0]), int(pt[1])
+        if 0 <= y < h and 0 <= x < w:
+            if half1_mask_rotated[i]:
+                half1_mask_bool[y, x] = True
+            else:
+                half2_mask_bool[y, x] = True
+    
+    # Compute standard deviation for bins in each half using the whole bbox (cut into two)
+    def compute_std_bins(mask_half_bool, rect_x_min, rect_x_max, R, cx, cy, y_min, y_max, angle, return_rect_info=False):
+        """
+        Divide bbox into 20 bins along the first principal axis and compute standard deviation
+        of pixel counts in each bin.
+        
+        Args:
+            mask_half_bool: HxW boolean mask for this half
+            rect_x_min: Minimum x coordinate of the bbox half (in rotated space)
+            rect_x_max: Maximum x coordinate of the bbox half (in rotated space)
+            R: Rotation matrix
+            cx, cy: Centroid coordinates
+            y_min, y_max: y range of bbox (in rotated space)
+            angle: Rotation angle
+            return_rect_info: If True, also return rectangle info for visualization
+            
+        Returns:
+            std_dev or (std_dev, rect_info)
+        """
+        try:
+            # Divide bbox into 10 bins along the first principal axis (x-axis in rotated space)
+            num_bins = 10
+            bin_width = (rect_x_max - rect_x_min) / num_bins
+            bin_edges = np.linspace(rect_x_min, rect_x_max, num_bins + 1)
+            
+            # Create a hash bool map for fast lookup: check if a pixel is in the mask
+            h, w = mask_half_bool.shape
+            # Use a set for O(1) lookup: store (x, y) tuples of mask pixels
+            mask_pixel_set = set()
+            y_coords_mask, x_coords_mask = np.where(mask_half_bool)
+            for x, y in zip(x_coords_mask, y_coords_mask):
+                mask_pixel_set.add((x, y))
+            
+            # For each bin, count how many pixels are inside the mask
+            bin_pixel_counts = []
+            bin_centers = []
+            
+            # Get the inverse rotation matrix to convert from rotated space back to original
+            R_inv = R.T
+            
+            for i in range(num_bins):
+                bin_x_min = bin_edges[i]
+                bin_x_max = bin_edges[i + 1]
+                bin_center = (bin_x_min + bin_x_max) / 2.0
+                bin_centers.append(bin_center)
+                
+                # Count pixels in this bin
+                pixel_count = 0
+                # Sample points in this bin (along x and y axes)
+                num_x_samples = max(1, int(bin_x_max - bin_x_min) + 1)
+                num_y_samples = max(1, int(y_max - y_min) + 1)
+                x_samples = np.linspace(bin_x_min, bin_x_max, num_x_samples)
+                y_samples = np.linspace(y_min, y_max, num_y_samples)
+                
+                for x_pos in x_samples:
+                    for y_pos in y_samples:
+                        # Convert this point from rotated space to original space
+                        point_rotated = np.array([x_pos, y_pos])
+                        point_centered = (R_inv @ point_rotated) + np.array([cx, cy])
+                        
+                        # Round to nearest pixel coordinates
+                        x_orig = int(np.round(point_centered[0]))
+                        y_orig = int(np.round(point_centered[1]))
+                        
+                        # Check if this pixel is inside the mask using hash lookup
+                        if (x_orig, y_orig) in mask_pixel_set:
+                            pixel_count += 1
+                
+                bin_pixel_counts.append(pixel_count)
+            
+            # Print pixel counts for each bin
+            #print(f"  [像素统计] bbox范围: x=[{rect_x_min:.1f}, {rect_x_max:.1f}], y=[{y_min:.1f}, {y_max:.1f}]")
+            #print(f"  [像素统计] 10个bins的像素数: {bin_pixel_counts}")
+            #
+            # Compute standard deviation after removing max and min
+            if len(bin_pixel_counts) > 2:
+                # Remove one max and one min value before computing standard deviation
+                bin_pixel_counts_filtered = bin_pixel_counts.copy()
+                # Find and remove one occurrence of max
+                max_idx = bin_pixel_counts_filtered.index(max(bin_pixel_counts_filtered))
+                bin_pixel_counts_filtered.pop(max_idx)
+                # Find and remove one occurrence of min
+                min_idx = bin_pixel_counts_filtered.index(min(bin_pixel_counts_filtered))
+                bin_pixel_counts_filtered.pop(min_idx)
+                std_dev = np.std(bin_pixel_counts_filtered)
+                avg_count = np.mean(bin_pixel_counts_filtered)
+            elif len(bin_pixel_counts) > 0:
+                # If only 1 or 2 bins, compute without filtering
+                std_dev = np.std(bin_pixel_counts)
+                avg_count = np.mean(bin_pixel_counts)
+            else:
+                std_dev = float('inf')
+                avg_count = 0.0
+            
+            #print(f"  [像素统计] 平均值: {avg_count:.2f}, 标准差: {std_dev:.2f}")
+            
+            if return_rect_info:
+                rect_info = {
+                    'angle': angle,
+                    'R': R,
+                    'x_min': rect_x_min, 'x_max': rect_x_max,
+                    'y_min': y_min, 'y_max': y_max,
+                    'centroid': np.array([cx, cy]),
+                    'std_dev': std_dev,
+                    'bin_pixel_counts': bin_pixel_counts,
+                    'bin_centers': bin_centers,
+                    'bin_edges': bin_edges
+                }
+                return std_dev, rect_info
+            
+            return std_dev
+            
+        except Exception as e:
+            # If computation fails, return infinity
+            if return_rect_info:
+                return float('inf'), None
+            return float('inf')
+    
+    # Compute standard deviations for bins in both halves using the whole bbox (cut into two)
+    #print(f"[检测] 开始计算两半的bins标准差...")
+    #print(f"[检测] Half1 bbox: x=[{x_min:.1f}, {x_mid:.1f}], y=[{y_min:.1f}, {y_max:.1f}]")
+    if debug:
+        std_dev1, rect_info1 = compute_std_bins(half1_mask_bool, x_min, x_mid, R, cx, cy, y_min, y_max, angle, return_rect_info=True)
+    else:
+        std_dev1 = compute_std_bins(half1_mask_bool, x_min, x_mid, R, cx, cy, y_min, y_max, angle, return_rect_info=False)
+        rect_info1 = None
+    
+    #print(f"[检测] Half2 bbox: x=[{x_mid:.1f}, {x_max:.1f}], y=[{y_min:.1f}, {y_max:.1f}]")
+    if debug:
+        std_dev2, rect_info2 = compute_std_bins(half2_mask_bool, x_mid, x_max, R, cx, cy, y_min, y_max, angle, return_rect_info=True)
+    else:
+        std_dev2 = compute_std_bins(half2_mask_bool, x_mid, x_max, R, cx, cy, y_min, y_max, angle, return_rect_info=False)
+        rect_info2 = None
+    
+    #print(f"[检测] Half1 标准差: {std_dev1:.2f}, Half2 标准差: {std_dev2:.2f}")
+    #print(f"[检测] 尾部: {'Half1' if std_dev1 < std_dev2 else 'Half2'} (标准差更小)")
+    
+    # The half with lower standard deviation is the tail (more uniform)
+    # Use std_dev as fitting_error for consistency with existing code
+    fitting_error1 = std_dev1
+    fitting_error2 = std_dev2
+    
+    # The half with lower fitting error (better rectangle fit) is the tail
+    # Now we need to determine which direction along the FIRST axis points to that half
+    
+    # Project centroids of each half onto the first principal axis
+    half1_centroid = half1_pts.mean(axis=0)
+    half2_centroid = half2_pts.mean(axis=0)
+    
+    # Compute signed distance from overall centroid along first axis
+    half1_centroid_centered = half1_centroid - np.array([cx, cy])
+    half2_centroid_centered = half2_centroid - np.array([cx, cy])
+    
+    proj1_half1 = half1_centroid_centered @ np.array([vx, vy])
+    proj1_half2 = half2_centroid_centered @ np.array([vx, vy])
+    
+    # Debug visualization
+    if debug and debug_output_path:
+        try:
+            # Create debug visualization
+            h, w = mask_bool.shape
+            debug_vis = np.zeros((h, w, 3), dtype=np.uint8)
+            
+            # Draw original mask in gray
+            debug_vis[mask_bool] = [128, 128, 128]
+            
+            # Draw half1 in red
+            half1_mask_img = np.zeros_like(mask_bool)
+            for pt in half1_pts:
+                x, y = int(pt[0]), int(pt[1])
+                if 0 <= y < h and 0 <= x < w:
+                    half1_mask_img[y, x] = True
+            debug_vis[half1_mask_img] = [0, 0, 255]  # Red
+            
+            # Draw half2 in blue
+            half2_mask_img = np.zeros_like(mask_bool)
+            for pt in half2_pts:
+                x, y = int(pt[0]), int(pt[1])
+                if 0 <= y < h and 0 <= x < w:
+                    half2_mask_img[y, x] = True
+            debug_vis[half2_mask_img] = [255, 0, 0]  # Blue
+            
+            # Draw dividing line (first PCA axis - the actual cut line)
+            line_length = max(h, w)
+            line_start = (int(cx - vx * line_length), int(cy - vy * line_length))
+            line_end = (int(cx + vx * line_length), int(cy + vy * line_length))
+            cv2.line(debug_vis, line_start, line_end, (0, 255, 255), 2)  # Cyan dividing line
+            
+            # Draw bboxes and bin dividers for each half
+            def draw_bbox_with_bins(vis_img, rect_info, color, label):
+                if rect_info is None:
+                    return
+                try:
+                    R = rect_info['R']
+                    x_min, x_max = rect_info['x_min'], rect_info['x_max']
+                    y_min, y_max = rect_info['y_min'], rect_info['y_max']
+                    centroid = rect_info.get('centroid', np.array([cx, cy]))
+                    bin_edges = rect_info.get('bin_edges', [])
+                    
+                    # Rectangle corners in rotated space
+                    corners_rot = np.array([
+                        [x_min, y_min],
+                        [x_max, y_min],
+                        [x_max, y_max],
+                        [x_min, y_max]
+                    ], dtype=np.float64)
+                    
+                    # Rotate back to original space
+                    R_inv = R.T  # Inverse rotation
+                    corners_orig = (R_inv @ corners_rot.T).T + centroid
+                    
+                    # Draw rectangle
+                    corners_int = corners_orig.astype(np.int32)
+                    cv2.polylines(vis_img, [corners_int], True, color, 2)
+                    
+                    # Draw bin dividers (lines parallel to second principal axis, i.e., y-axis in rotated space)
+                    for x_pos in bin_edges:
+                        # Line endpoints in rotated space
+                        line_pts_rot = np.array([
+                            [x_pos, y_min],
+                            [x_pos, y_max]
+                        ], dtype=np.float64)
+                        # Transform to original space
+                        line_pts_orig = (R_inv @ line_pts_rot.T).T + centroid
+                        line_pts_int = line_pts_orig.astype(np.int32)
+                        cv2.line(vis_img, tuple(line_pts_int[0]), tuple(line_pts_int[1]), color, 1)
+                    
+                    # Add label
+                    center = corners_int.mean(axis=0).astype(int)
+                    cv2.putText(vis_img, label, tuple(center), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+                except Exception as e:
+                    pass
+            
+            # Draw bbox and bin dividers for half1 (red)
+            if rect_info1:
+                draw_bbox_with_bins(debug_vis, rect_info1, (0, 0, 255), f"H1 (std={fitting_error1:.2f})")
+            
+            # Draw bbox and bin dividers for half2 (blue)
+            if rect_info2:
+                draw_bbox_with_bins(debug_vis, rect_info2, (255, 0, 0), f"H2 (std={fitting_error2:.2f})")
+            
+            # Add text
+            tail_half = "Half1" if fitting_error1 < fitting_error2 else "Half2"
+            cv2.putText(debug_vis, f"Tail: {tail_half} (lower std)", (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(debug_vis, f"Std1: {fitting_error1:.2f}", (10, 60), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            cv2.putText(debug_vis, f"Std2: {fitting_error2:.2f}", (10, 90), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+            
+            # Save debug visualization
+            debug_path = f"{debug_output_path}_debug_division.png"
+            cv2.imwrite(debug_path, debug_vis)
+            
+            # Also save individual halves with their bboxes and bin dividers
+            half1_vis = np.zeros((h, w, 3), dtype=np.uint8)
+            half1_vis[half1_mask_img] = [255, 255, 255]
+            if rect_info1:
+                draw_bbox_with_bins(half1_vis, rect_info1, (0, 255, 0), f"Std: {fitting_error1:.2f}")
+            cv2.imwrite(f"{debug_output_path}_half1.png", half1_vis)
+            
+            half2_vis = np.zeros((h, w, 3), dtype=np.uint8)
+            half2_vis[half2_mask_img] = [255, 255, 255]
+            if rect_info2:
+                draw_bbox_with_bins(half2_vis, rect_info2, (0, 255, 0), f"Std: {fitting_error2:.2f}")
+            cv2.imwrite(f"{debug_output_path}_half2.png", half2_vis)
+            
+        except Exception as e:
+            print(f"[调试] 保存调试可视化失败: {e}")
+    
+    # Determine which half is tail (lower average = tail)
+    tail_is_half1 = fitting_error1 < fitting_error2
+    if tail_is_half1:
+        # half1 is tail (lower average)
+        # Check which direction along first axis points to half1
+        if proj1_half1 < 0:
+            return True  # Negative direction points to tail, current direction is correct
+        else:
+            return False  # Positive direction points to tail, need to flip
+    else:
+        # half2 is tail (lower average)
+        # Check which direction along first axis points to half2
+        if proj1_half2 < 0:
+            return True  # Negative direction points to tail, current direction is correct
+        else:
+            return False  # Positive direction points to tail, need to flip
+
+
+def calculate_fish_grasp_point(mask_bool: np.ndarray, vx: float, vy: float, centroid: Tuple[float, float],
+                               debug: bool = False, debug_output_path: Optional[str] = None) -> Optional[Tuple[float, float]]:
+    """
+    Calculate the grasp point for the fish based on the tail part.
+    
+    Strategy:
+    1. Identify the tail part (using the same logic as detect_tail_direction)
+    2. Recalculate PCA for the tail part to get its principal axis
+    3. Find the intersection of the tail's principal axis with the border line
+       (the dividing line between head and tail bboxes)
+    
+    Args:
+        mask_bool: HxW boolean array; True indicates body pixels
+        vx, vy: First principal direction vector (unit vector) - main body axis
+        centroid: (cx, cy) centroid of the mask
+        debug: If True, save debug visualizations
+        debug_output_path: Path prefix for debug output files
+    
+    Returns:
+        (grasp_x, grasp_y) or None if calculation fails
+    """
+    ys, xs = np.where(mask_bool)
+    if ys.size < 20:
+        return None
+    
+    cx, cy = centroid
+    
+    # Get all points
+    pts = np.stack([xs.astype(np.float64), ys.astype(np.float64)], axis=1)
+    pts_centered = pts - np.array([cx, cy])
+    
+    # Compute PCA to get principal directions for the whole fish
+    U, S, Vt = np.linalg.svd(pts_centered, full_matrices=False)
+    if Vt.shape[0] < 2:
+        return None
+    
+    # First principal direction (main body axis)
+    dir1 = Vt[0]
+    
+    # Rotate all points to align with principal axis
+    angle = math.atan2(dir1[1], dir1[0])
+    cos_a, sin_a = math.cos(-angle), math.sin(-angle)
+    R = np.array([[cos_a, -sin_a], [sin_a, cos_a]])
+    pts_rotated = (R @ pts_centered.T).T
+    
+    # Fit axis-aligned rectangle for the whole fish
+    x_min, x_max = pts_rotated[:, 0].min(), pts_rotated[:, 0].max()
+    y_min, y_max = pts_rotated[:, 1].min(), pts_rotated[:, 1].max()
+    
+    # Split the rectangle into two halves along the first principal axis
+    x_mid = (x_min + x_max) / 2.0
+    
+    # Split points into two halves
+    half1_mask_rotated = pts_rotated[:, 0] < x_mid
+    half2_mask_rotated = pts_rotated[:, 0] >= x_mid
+    
+    if half1_mask_rotated.sum() < 10 or half2_mask_rotated.sum() < 10:
+        return None
+    
+    # Get points for each half
+    half1_pts = pts[half1_mask_rotated]
+    half2_pts = pts[half2_mask_rotated]
+    
+    # Create boolean masks for each half
+    h, w = mask_bool.shape
+    half1_mask_bool = np.zeros_like(mask_bool)
+    half2_mask_bool = np.zeros_like(mask_bool)
+    for i, pt in enumerate(pts):
+        x, y = int(pt[0]), int(pt[1])
+        if 0 <= y < h and 0 <= x < w:
+            if half1_mask_rotated[i]:
+                half1_mask_bool[y, x] = True
+            else:
+                half2_mask_bool[y, x] = True
+    
+    # Compute standard deviations to determine which half is tail
+    def compute_std_bins_quick(mask_half_bool, rect_x_min, rect_x_max, R, cx, cy, y_min, y_max, angle):
+        """Quick version without debug info"""
+        try:
+            num_bins = 10
+            bin_width = (rect_x_max - rect_x_min) / num_bins
+            bin_edges = np.linspace(rect_x_min, rect_x_max, num_bins + 1)
+            
+            h, w = mask_half_bool.shape
+            mask_pixel_set = set()
+            y_coords_mask, x_coords_mask = np.where(mask_half_bool)
+            for x, y in zip(x_coords_mask, y_coords_mask):
+                mask_pixel_set.add((x, y))
+            
+            bin_pixel_counts = []
+            R_inv = R.T
+            
+            for i in range(num_bins):
+                bin_x_min = bin_edges[i]
+                bin_x_max = bin_edges[i + 1]
+                
+                pixel_count = 0
+                num_x_samples = max(1, int(bin_x_max - bin_x_min) + 1)
+                num_y_samples = max(1, int(y_max - y_min) + 1)
+                x_samples = np.linspace(bin_x_min, bin_x_max, num_x_samples)
+                y_samples = np.linspace(y_min, y_max, num_y_samples)
+                
+                for x_pos in x_samples:
+                    for y_pos in y_samples:
+                        point_rotated = np.array([x_pos, y_pos])
+                        point_centered = (R_inv @ point_rotated) + np.array([cx, cy])
+                        x_orig = int(np.round(point_centered[0]))
+                        y_orig = int(np.round(point_centered[1]))
+                        if (x_orig, y_orig) in mask_pixel_set:
+                            pixel_count += 1
+                
+                bin_pixel_counts.append(pixel_count)
+            
+            if len(bin_pixel_counts) > 2:
+                bin_pixel_counts_filtered = bin_pixel_counts.copy()
+                max_idx = bin_pixel_counts_filtered.index(max(bin_pixel_counts_filtered))
+                bin_pixel_counts_filtered.pop(max_idx)
+                min_idx = bin_pixel_counts_filtered.index(min(bin_pixel_counts_filtered))
+                bin_pixel_counts_filtered.pop(min_idx)
+                return np.std(bin_pixel_counts_filtered)
+            elif len(bin_pixel_counts) > 0:
+                return np.std(bin_pixel_counts)
+            else:
+                return float('inf')
+        except Exception:
+            return float('inf')
+    
+    std_dev1 = compute_std_bins_quick(half1_mask_bool, x_min, x_mid, R, cx, cy, y_min, y_max, angle)
+    std_dev2 = compute_std_bins_quick(half2_mask_bool, x_mid, x_max, R, cx, cy, y_min, y_max, angle)
+    
+    # Determine which half is tail (lower std_dev = tail)
+    tail_mask_bool = half1_mask_bool if std_dev1 < std_dev2 else half2_mask_bool
+    tail_pts = half1_pts if std_dev1 < std_dev2 else half2_pts
+    head_mask_bool = half2_mask_bool if std_dev1 < std_dev2 else half1_mask_bool
+    head_pts = half2_pts if std_dev1 < std_dev2 else half1_pts
+    
+    if tail_pts.size == 0 or head_pts.size == 0:
+        return None
+    
+    # Recalculate PCA for the head part to get head's principal axis
+    head_centroid = head_pts.mean(axis=0)
+    head_pts_centered = head_pts - head_centroid
+    
+    U_head, S_head, Vt_head = np.linalg.svd(head_pts_centered, full_matrices=False)
+    if Vt_head.shape[0] < 1:
+        return None
+    
+    # Head's principal direction
+    head_dir = Vt_head[0]
+    head_dir_norm = math.hypot(head_dir[0], head_dir[1]) or 1.0
+    head_vx = head_dir[0] / head_dir_norm
+    head_vy = head_dir[1] / head_dir_norm
+    
+    # Ensure direction is similar to the whole fish first PCA direction (vx, vy) which points to tail
+    # Check alignment with whole fish PCA direction
+    alignment_with_whole = (head_vx * vx + head_vy * vy)
+    
+    # If the dot product is negative, the directions are opposite, so flip head PCA
+    if alignment_with_whole < 0:
+        head_vx = -head_vx
+        head_vy = -head_vy
+    
+    # Recalculate PCA for the tail part only to get tail's principal axis
+    tail_centroid = tail_pts.mean(axis=0)
+    tail_cx, tail_cy = tail_centroid[0], tail_centroid[1]  # For debug visualization
+    tail_pts_centered = tail_pts - tail_centroid
+    
+    U_tail, S_tail, Vt_tail = np.linalg.svd(tail_pts_centered, full_matrices=False)
+    if Vt_tail.shape[0] < 1:
+        return None
+    
+    # Tail's principal direction
+    tail_dir = Vt_tail[0]
+    tail_dir_norm = math.hypot(tail_dir[0], tail_dir[1]) or 1.0
+    tail_vx = tail_dir[0] / tail_dir_norm
+    tail_vy = tail_dir[1] / tail_dir_norm
+    
+    # Ensure direction points away from body center (toward tail end)
+    # The tail is the half with lower std_dev, so we need to find which direction
+    # along the tail's PCA points further away from the body center
+    tail_centroid_vec = tail_centroid - np.array([cx, cy])
+    
+    # Project tail centroid vector onto tail PCA direction
+    proj_on_tail_pca = tail_centroid_vec @ np.array([tail_vx, tail_vy])
+    
+    # If projection is negative, flip the direction
+    # This ensures the direction points from body center toward the tail end
+    if proj_on_tail_pca < 0:
+        tail_vx = -tail_vx
+        tail_vy = -tail_vy
+    
+    # Additional check: find the farthest point in the tail along the tail PCA direction
+    # and ensure the direction points toward that farthest point
+    tail_pts_relative = tail_pts - tail_centroid
+    projections = tail_pts_relative @ np.array([tail_vx, tail_vy])
+    max_proj_idx = np.argmax(projections)
+    farthest_pt = tail_pts[max_proj_idx]
+    farthest_vec = farthest_pt - tail_centroid
+    
+    # If the farthest point is in the opposite direction, flip
+    if farthest_vec @ np.array([tail_vx, tail_vy]) < 0:
+        tail_vx = -tail_vx
+        tail_vy = -tail_vy
+    
+    # The border line is the dividing line between head and tail bboxes
+    # This is along the second PCA direction of the whole fish mask
+    # In rotated space, this is the line x = x_mid (perpendicular to first PCA)
+    # We need to find the intersection of the average PCA direction with this border line
+    
+    # Get second principal direction (perpendicular to first)
+    dir2 = Vt[1]
+    norm2 = math.hypot(dir2[0], dir2[1]) or 1.0
+    v2x = dir2[0] / norm2
+    v2y = dir2[1] / norm2
+    
+    # Ensure second PCA direction points toward head
+    # Project head centroid onto second PCA direction to determine correct orientation
+    head_centroid_vec = head_centroid - np.array([cx, cy])
+    proj_on_second_pca = head_centroid_vec @ np.array([v2x, v2y])
+    
+    # If projection is negative, flip the direction to point toward head
+    if proj_on_second_pca < 0:
+        v2x = -v2x
+        v2y = -v2y
+    
+    # Calculate average of whole fish first PCA direction and head PCA direction
+    # Both should point in similar direction (toward tail)
+    # Whole fish first PCA direction is (vx, vy) - points to tail
+    # Head PCA direction is (head_vx, head_vy) - should also point to tail (after alignment)
+    # The average should be between these two directions
+    avg_vx = (vx + head_vx) / 2.0
+    avg_vy = (vy + head_vy) / 2.0
+    avg_norm = math.hypot(avg_vx, avg_vy) or 1.0
+    avg_vx /= avg_norm
+    avg_vy /= avg_norm
+    
+    # Use head centroid as the point for the average PCA axis
+    # (since we want the intersection near the border, using head centroid makes sense)
+    avg_axis_point = head_centroid
+    
+    # The border line in rotated space: x = x_mid, y from y_min to y_max
+    # Transform border line to original space
+    R_inv = R.T  # Inverse rotation matrix
+    
+    # Border line endpoints in rotated space (along second PCA direction)
+    border_y_start = y_min
+    border_y_end = y_max
+    border_pt1_rot = np.array([x_mid, border_y_start])
+    border_pt2_rot = np.array([x_mid, border_y_end])
+    
+    # Transform to original space
+    border_pt1_orig = (R_inv @ border_pt1_rot) + np.array([cx, cy])
+    border_pt2_orig = (R_inv @ border_pt2_rot) + np.array([cx, cy])
+    
+    # Border line: from border_pt1_orig to border_pt2_orig (along second PCA direction)
+    # Average PCA axis: passes through avg_axis_point (head_centroid), direction (avg_vx, avg_vy)
+    # Find intersection of these two lines
+    
+    # Parametric form:
+    # Border line: P = border_pt1_orig + t * (border_pt2_orig - border_pt1_orig)
+    # Average PCA axis: Q = avg_axis_point + s * (avg_vx, avg_vy)
+    
+    border_dir = border_pt2_orig - border_pt1_orig
+    avg_dir_vec = np.array([avg_vx, avg_vy])
+    
+    # Solve for intersection: border_pt1_orig + t * border_dir = avg_axis_point + s * avg_dir_vec
+    # Rearrange: t * border_dir - s * avg_dir_vec = avg_axis_point - border_pt1_orig
+    
+    # Use cross product to solve
+    # If lines are parallel, project avg_axis_point onto border line
+    cross_product = border_dir[0] * avg_dir_vec[1] - border_dir[1] * avg_dir_vec[0]
+    
+    if abs(cross_product) < 1e-6:
+        # Lines are parallel, project avg_axis_point onto border line
+        border_dir_norm = np.linalg.norm(border_dir)
+        if border_dir_norm < 1e-6:
+            # Border line is degenerate, use avg_axis_point
+            grasp_point = avg_axis_point
+        else:
+            # Project avg_axis_point onto border line
+            vec_to_point = avg_axis_point - border_pt1_orig
+            t = np.dot(vec_to_point, border_dir) / (border_dir_norm ** 2)
+            t = np.clip(t, 0, 1)  # Clamp to border line segment
+            grasp_point = border_pt1_orig + t * border_dir
+    else:
+        # Lines intersect, solve for t and s
+        # We have: border_pt1_orig + t * border_dir = avg_axis_point + s * avg_dir_vec
+        # Rearrange: t * border_dir - s * avg_dir_vec = avg_axis_point - border_pt1_orig
+        rhs = avg_axis_point - border_pt1_orig
+        
+        # Solve using Cramer's rule for the system:
+        # [border_dir[0]  -avg_dir_vec[0]] [t]   [rhs[0]]
+        # [border_dir[1]  -avg_dir_vec[1]] [s] = [rhs[1]]
+        # 
+        # det = border_dir[0] * (-avg_dir_vec[1]) - border_dir[1] * (-avg_dir_vec[0])
+        #     = -(border_dir[0] * avg_dir_vec[1] - border_dir[1] * avg_dir_vec[0])
+        #     = -cross_product
+        det = -cross_product
+        
+        if abs(det) < 1e-10:
+            # Lines are parallel (shouldn't happen since we checked cross_product)
+            # Fall back to projection
+            border_dir_norm = np.linalg.norm(border_dir)
+            if border_dir_norm < 1e-6:
+                grasp_point = avg_axis_point
+            else:
+                vec_to_point = avg_axis_point - border_pt1_orig
+                t = np.dot(vec_to_point, border_dir) / (border_dir_norm ** 2)
+                t = np.clip(t, 0, 1)
+                grasp_point = border_pt1_orig + t * border_dir
+        else:
+            # Cramer's rule
+            t_det = rhs[0] * (-avg_dir_vec[1]) - rhs[1] * (-avg_dir_vec[0])
+            s_det = border_dir[0] * rhs[1] - border_dir[1] * rhs[0]
+            
+            t = t_det / det
+            s = s_det / det
+            
+            # Calculate intersection point from both lines and verify they match
+            point_from_border = border_pt1_orig + t * border_dir
+            point_from_avg_axis = avg_axis_point + s * avg_dir_vec
+            
+            # Use the average of both calculations for accuracy
+            grasp_point = (point_from_border + point_from_avg_axis) / 2.0
+    
+    # Move the intersection point 20% of the whole fish principal axis length toward head
+    # Calculate the whole fish principal axis length (from head to tail)
+    # Project all points onto the first principal axis to find the extent
+    pts_centered = pts - np.array([cx, cy])
+    projections = pts_centered @ np.array([vx, vy])
+    principal_axis_length = projections.max() - projections.min()
+    
+    if principal_axis_length > 1e-6:
+        # Direction: along the first principal axis, pointing toward head (opposite of vx, vy)
+        # Move 20% of the principal axis length in the head direction
+        move_distance = principal_axis_length * 0.05
+        grasp_point = grasp_point + np.array([-vx, -vy]) * move_distance
+    
+    # Debug visualization
+    if debug and debug_output_path:
+        try:
+            debug_vis = np.zeros((h, w, 3), dtype=np.uint8)
+            debug_vis[mask_bool] = [128, 128, 128]  # Gray for whole mask
+            debug_vis[tail_mask_bool] = [0, 255, 0]  # Green for tail
+            
+            # Draw border line (dividing line between head and tail) - Second PCA direction
+            border_pt1_int = (int(border_pt1_orig[0]), int(border_pt1_orig[1]))
+            border_pt2_int = (int(border_pt2_orig[0]), int(border_pt2_orig[1]))
+            cv2.line(debug_vis, border_pt1_int, border_pt2_int, (255, 0, 255), 3)  # Magenta for border line (thicker)
+            
+            # Draw whole fish first PCA axis (green arrow) - for reference
+            whole_line_length = max(h, w) * 0.5
+            line_start_whole = (int(cx - vx * whole_line_length), int(cy - vy * whole_line_length))
+            line_end_whole = (int(cx + vx * whole_line_length), int(cy + vy * whole_line_length))
+            cv2.line(debug_vis, line_start_whole, line_end_whole, (0, 255, 0), 2)  # Green for whole fish PCA
+            cv2.arrowedLine(debug_vis, (int(cx), int(cy)), line_end_whole, (0, 255, 0), 2, tipLength=0.2)  # Green arrow
+            
+            # Draw average PCA axis (average of whole fish PCA and head PCA) - Cyan
+            line_length_main = max(h, w) * 0.6
+            avg_cx, avg_cy = avg_axis_point
+            line_start_main = (int(avg_cx - avg_vx * line_length_main), int(avg_cy - avg_vy * line_length_main))
+            line_end_main = (int(avg_cx + avg_vx * line_length_main), int(avg_cy + avg_vy * line_length_main))
+            cv2.line(debug_vis, line_start_main, line_end_main, (255, 255, 0), 3)  # Cyan for average PCA axis
+            
+            # Also draw head PCA axis for reference (thinner, with arrow)
+            head_cx, head_cy = head_centroid
+            head_line_length = line_length_main * 0.5
+            line_start_head = (int(head_cx - head_vx * head_line_length), int(head_cy - head_vy * head_line_length))
+            line_end_head = (int(head_cx + head_vx * head_line_length), int(head_cy + head_vy * head_line_length))
+            # Draw line
+            cv2.line(debug_vis, line_start_head, line_end_head, (0, 255, 255), 2)  # Yellow for head PCA (reference)
+            # Draw arrow pointing in head direction
+            cv2.arrowedLine(debug_vis, (int(head_cx), int(head_cy)), line_end_head, (0, 255, 255), 2, tipLength=0.2)  # Yellow arrow
+            
+            # Add labels for the intersection lines
+            # Label for border line (second PCA)
+            border_mid = ((border_pt1_int[0] + border_pt2_int[0]) // 2, 
+                         (border_pt1_int[1] + border_pt2_int[1]) // 2)
+            cv2.putText(debug_vis, "Border (2nd PCA)", 
+                       (border_mid[0] + 10, border_mid[1]), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+            
+            # Label for whole fish PCA axis
+            axis_mid_whole = ((line_start_whole[0] + line_end_whole[0]) // 2, (line_start_whole[1] + line_end_whole[1]) // 2)
+            cv2.putText(debug_vis, "Whole PCA", 
+                       (axis_mid_whole[0] + 10, axis_mid_whole[1] - 10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            
+            # Label for average PCA axis
+            axis_mid_main = ((line_start_main[0] + line_end_main[0]) // 2, (line_start_main[1] + line_end_main[1]) // 2)
+            cv2.putText(debug_vis, "Avg PCA (Whole+Head)", 
+                       (axis_mid_main[0] + 10, axis_mid_main[1] - 10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+            
+            # Label for head PCA axis
+            axis_mid_head = ((line_start_head[0] + line_end_head[0]) // 2, (line_start_head[1] + line_end_head[1]) // 2)
+            cv2.putText(debug_vis, "Head PCA", 
+                       (axis_mid_head[0] + 10, axis_mid_head[1] - 10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+            
+            # Draw grasp point with multiple visual indicators
+            gx, gy = int(np.round(grasp_point[0])), int(np.round(grasp_point[1]))
+            
+            # Large filled circle
+            cv2.circle(debug_vis, (gx, gy), 8, (0, 0, 255), -1)  # Red filled circle
+            # Outer circle outline
+            cv2.circle(debug_vis, (gx, gy), 15, (0, 0, 255), 2)  # Red circle outline
+            # Cross mark for precise location
+            cross_size = 12
+            cv2.line(debug_vis, (gx - cross_size, gy), (gx + cross_size, gy), (255, 255, 255), 2)  # White horizontal line
+            cv2.line(debug_vis, (gx, gy - cross_size), (gx, gy + cross_size), (255, 255, 255), 2)  # White vertical line
+            
+            # Draw a line from head centroid to grasp point (showing the 10% offset direction)
+            cv2.line(debug_vis, (int(head_cx), int(head_cy)), (gx, gy), (255, 255, 0), 1)  # Cyan line showing head direction
+            
+            # Add text label
+            cv2.putText(debug_vis, "Grasp Point", (gx + 20, gy - 10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            cv2.putText(debug_vis, f"({gx}, {gy})", (gx + 20, gy + 15), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            # Draw tail centroid
+            cv2.circle(debug_vis, (int(tail_cx), int(tail_cy)), 5, (0, 255, 255), -1)  # Yellow for tail centroid
+            cv2.circle(debug_vis, (int(tail_cx), int(tail_cy)), 8, (0, 255, 255), 1)  # Yellow outline
+            
+            cv2.imwrite(f"{debug_output_path}_grasp_point.png", debug_vis)
+            print(f"[调试] 抓取点已保存: ({gx}, {gy})")
+        except Exception as e:
+            print(f"[调试] 保存抓取点可视化失败: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    return (float(grasp_point[0]), float(grasp_point[1]))
+
+
+def estimate_body_angle_alpha1(mask_bool: np.ndarray, return_details: bool = False, 
+                               debug: bool = False, debug_output_path: Optional[str] = None):
     """
     Estimate the principal body direction from a binary mask using SVD (PCA).
+    Ensures the direction vector points toward the tail.
 
     Angle definition (consistent with realtime_segmentation_3d):
     - alpha_1 is the signed angle between the principal axis and the image vertical axis (y-axis).
@@ -16,6 +821,8 @@ def estimate_body_angle_alpha1(mask_bool: np.ndarray, return_details: bool = Fal
     Args:
         mask_bool: HxW boolean array; True indicates body pixels
         return_details: if True, also return (dir_unit, centroid)
+        debug: If True, enable debug mode for tail detection
+        debug_output_path: Path prefix for debug output files
 
     Returns:
         alpha_1 or (alpha_1, dir_unit, centroid)
@@ -44,11 +851,45 @@ def estimate_body_angle_alpha1(mask_bool: np.ndarray, return_details: bool = Fal
     vx /= norm
     vy /= norm
 
+    # Detect tail direction and flip if necessary
+    points_to_tail = detect_tail_direction(mask_bool, vx, vy, (float(centroid[0]), float(centroid[1])), 
+                                           debug=debug, debug_output_path=debug_output_path)
+    if not points_to_tail:
+        vx = -vx
+        vy = -vy
+
     alpha_1 = math.atan2(vx, vy)  # angle to vertical
     alpha_1 = (alpha_1 + math.pi) % (2 * math.pi) - math.pi
 
     if return_details:
         return float(alpha_1), (float(vx), float(vy)), (float(centroid[0]), float(centroid[1]))
+    return float(alpha_1)
+
+
+def estimate_body_angle_and_grasp_point(mask_bool: np.ndarray, return_details: bool = False,
+                                         debug: bool = False, debug_output_path: Optional[str] = None):
+    """
+    Estimate body angle and calculate grasp point in one call.
+    
+    Args:
+        mask_bool: HxW boolean array; True indicates body pixels
+        return_details: if True, also return (dir_unit, centroid, grasp_point)
+        debug: If True, enable debug mode
+        debug_output_path: Path prefix for debug output files
+    
+    Returns:
+        alpha_1 or (alpha_1, dir_unit, centroid, grasp_point)
+    """
+    alpha_1, (vx, vy), (cx, cy) = estimate_body_angle_alpha1(
+        mask_bool, return_details=True, debug=debug, debug_output_path=debug_output_path
+    )
+    
+    grasp_point = calculate_fish_grasp_point(
+        mask_bool, vx, vy, (cx, cy), debug=debug, debug_output_path=debug_output_path
+    )
+    
+    if return_details:
+        return float(alpha_1), (float(vx), float(vy)), (float(cx), float(cy)), grasp_point
     return float(alpha_1)
 
 

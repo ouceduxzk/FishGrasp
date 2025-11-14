@@ -333,6 +333,7 @@ def camera_calibrate(iamges_path, enable_error_analysis=True):
     # 标定得到图案在相机坐标系下的位姿
     # 使用畸变系数进行更精确的标定
     ret, mtx, dist, rvecs, tvecs = cv2.calibrateCamera(obj_points, img_points, size, None, None)
+    print(f"tvecs {tvecs}")
 
     # print("ret:", ret)
     print("内参矩阵:\n", mtx)  # 内参数矩阵

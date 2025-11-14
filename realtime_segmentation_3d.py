@@ -35,12 +35,14 @@ import json
 from seg import init_models
 from util import (
     estimate_body_angle_alpha1,
+    estimate_body_angle_and_grasp_point,
     draw_principal_axis,
     angle_between_2d_from_origin,
     apply_hand_eye_transform as util_apply_hand_eye_transform,
     tool_offset_to_base as util_tool_offset_to_base,
 )
 from mask_to_3d import mask_to_3d_pointcloud, save_pointcloud, load_camera_intrinsics
+from filter_mask import divide_mask
 from realsense_capture import (
     setup_realsense,
     save_pointcloud_to_file,
@@ -83,7 +85,8 @@ except ImportError:
 class RealtimeSegmentation3D:
     def __init__(self, output_dir, device="cpu", save_pointcloud=True, intrinsics_file=None, hand_eye_file=None, bbox_selection="highest_confidence", debug=False, use_yolo=False, yolo_weights=None,
                  grasp_point_mode: str = "centroid", landmark_model_path: str = None, enable_weight_tracking: bool = True, max_container_weight: float = 12.5, det_gray: bool = False,
-                 camera_calib_json: str = None, robot_config: str = "config/robot.json"):
+                 camera_calib_json: str = None, robot_config: str = "config/robot.json", erode_bbox: bool = False, erode_ratio: float = 0.1, bbox_scale: float = 1.0,
+                 seg_model: str = "sam", yolo_seg_weights: str = None):
         """
         初始化实时分割和3D点云生成器
         
@@ -101,6 +104,11 @@ class RealtimeSegmentation3D:
             landmark_model_path: AI关键点模型路径
             enable_weight_tracking: 是否启用重量跟踪
             max_container_weight: 容器最大重量（kg）
+            erode_bbox: 是否对mask进行上下方向腐蚀（用于更精确的质心计算）
+            erode_ratio: 腐蚀比例，上下各腐蚀的比例（默认0.1，即10%）
+            bbox_scale: 边界框缩放因子（默认1.0，即不缩放；>1.0放大，<1.0缩小）
+            seg_model: 分割模型类型 ("sam" 或 "yolov8_seg")，默认 "sam"
+            yolo_seg_weights: YOLOv8分割模型权重路径（当seg_model="yolov8_seg"时必需）
         """
         self.output_dir = output_dir
         self.device = device
@@ -109,6 +117,9 @@ class RealtimeSegmentation3D:
         self.debug = debug
         self.use_yolo = use_yolo
         self.yolo_weights = yolo_weights
+        self.erode_bbox = erode_bbox
+        self.erode_ratio = erode_ratio
+        self.bbox_scale = bbox_scale
         # detection-only grayscale support (optional)
         self.det_gray = det_gray
         # 抓取点模式：centroid 或 ai
@@ -120,6 +131,9 @@ class RealtimeSegmentation3D:
         # configs
         self.camera_calib_json = camera_calib_json
         self.robot_config = robot_config
+        # 分割模型相关
+        self.seg_model = seg_model
+        self.yolo_seg_weights = yolo_seg_weights
         # 创建输出目录（仅在debug模式下创建）
         if self.debug:
             self.rgb_dir = os.path.join(output_dir, "rgb")
@@ -143,7 +157,12 @@ class RealtimeSegmentation3D:
         # 初始化模型
         print("正在初始化AI模型...")
         #self.sam_predictor, self.grounding_dino_model, self.processor = init_models(device)
-        self.sam_predictor = init_models(device)
+        self.seg_predictor = init_models(device, seg_model=seg_model, yolo_seg_weights=yolo_seg_weights)
+        # 为了向后兼容，保留 sam_predictor 属性
+        if seg_model == "sam":
+            self.sam_predictor = self.seg_predictor
+        else:
+            self.sam_predictor = None  # 使用yolov8_seg时不需要sam_predictor
 
         if self.use_yolo:
             if not self.yolo_weights or not os.path.exists(self.yolo_weights):
@@ -235,7 +254,8 @@ class RealtimeSegmentation3D:
                     [ 0.09064269, -0.99579624, -0.01318166],
                     [-0.05149178, -0.01790468,  0.9985129 ]
                 ], dtype=np.float32)
-                t_default = np.array([[0.07037777], [0.09996735], [-0.18889416]], dtype=np.float32)
+                t_default = np.array([[0.0607777], [0.10496735], [-0.18889416]], dtype=np.float32)
+
                 self.hand_eye_transform = np.eye(4, dtype=np.float32)
                 self.hand_eye_transform[:3, :3] = R_default
                 self.hand_eye_transform[:3, 3:4] = t_default
@@ -346,7 +366,7 @@ class RealtimeSegmentation3D:
         detection_start = time.time()
         #if getattr(self, 'use_yolo', False):
         # YOLO 路径：detect_yolo 已返回所有满足条件的框 (x1,y1,x2,y2,conf)
-        boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.25, iou=0.45, imgsz=640, min_area=2500)
+        boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.6, iou=0.45, imgsz=640, min_area=8000)
        
         detection_time = time.time() - detection_start
         self.timers['detection'].append(detection_time)
@@ -361,54 +381,188 @@ class RealtimeSegmentation3D:
         base_name = f"frame_{self.frame_count:06d}_{timestamp}"
 
         image_rgb = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
-        self.sam_predictor.set_image(image_rgb)
+        
+        # 初始化变量，用于SAM分割
+        image_rgb_for_sam = image_rgb  # 默认使用原始图像
+        
+        # 根据分割模型类型选择不同的处理方式
+        if self.seg_model == "yolov8_seg":
+            # 使用YOLOv8分割模型
+            # YOLOv8可以直接对整个图像进行分割，然后根据bbox提取对应的mask
+            try:
+                yolo_results = self.seg_predictor(color_image, verbose=False)
+                # 提取所有检测结果
+                all_yolo_boxes = []
+                all_yolo_masks = []
+                for result in yolo_results:
+                    if result.masks is not None:
+                        boxes_yolo = result.boxes.xyxy.cpu().numpy()
+                        masks_yolo = result.masks.data.cpu().numpy()
+                        all_yolo_boxes.extend(boxes_yolo)
+                        all_yolo_masks.extend(masks_yolo)
+            except Exception as e:
+                print(f"[分割] YOLOv8分割失败: {e}")
+                return None, None
+        else:
+            # 使用SAM模型 - 在分割前进行对比度增强预处理
+            # 使用CLAHE (Contrast Limited Adaptive Histogram Equalization) 增强对比度
+            # 这有助于提高边界清晰度
+            try:
+                # 转换到LAB颜色空间，只对L通道进行CLAHE
+                lab = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2LAB)
+                l_channel, a, b = cv2.split(lab)
+                
+                # 应用CLAHE到L通道
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                l_channel_enhanced = clahe.apply(l_channel)
+                
+                # 合并通道并转换回RGB
+                lab_enhanced = cv2.merge([l_channel_enhanced, a, b])
+                image_rgb_enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2RGB)
+                
+                # 使用增强后的图像进行SAM分割
+                self.sam_predictor.set_image(image_rgb_enhanced)
+                # 保存增强后的图像引用，用于后续的predict_torch调用
+                image_rgb_for_sam = image_rgb_enhanced
+            except Exception as e:
+                print(f"[预处理] 对比度增强失败，使用原始图像: {e}")
+                # 如果预处理失败，使用原始图像
+                self.sam_predictor.set_image(image_rgb)
+                image_rgb_for_sam = image_rgb
 
         best_idx = -1
         best_depth_m = float('inf')
         best_mask = None
+        best_confidence = -1.0  # For highest_confidence selection
 
         segmentation_start = time.time()
         for i, b in enumerate(boxes):
             x1, y1, x2, y2 = b[:4]
-            boxes_tensor = torch.tensor([[x1, y1, x2, y2]], device=self.device)
-            transformed_boxes = self.sam_predictor.transform.apply_boxes_torch(boxes_tensor, image_rgb.shape[:2])
+            confidence = b[4] if len(b) > 4 else 0.0  # Get confidence from bbox
+            
+            if self.seg_model == "yolov8_seg":
+                # 使用YOLOv8分割
+                try:
+                    # 从YOLOv8结果中找到与当前bbox最匹配的检测
+                    mask_np = None
+                    best_iou = 0.0
+                    best_mask_idx = -1
+                    
+                    for j, (box_yolo, mask_yolo) in enumerate(zip(all_yolo_boxes, all_yolo_masks)):
+                        # 计算IoU
+                        box_yolo_x1, box_yolo_y1, box_yolo_x2, box_yolo_y2 = box_yolo
+                        intersection_x1 = max(x1, box_yolo_x1)
+                        intersection_y1 = max(y1, box_yolo_y1)
+                        intersection_x2 = min(x2, box_yolo_x2)
+                        intersection_y2 = min(y2, box_yolo_y2)
+                        
+                        if intersection_x2 > intersection_x1 and intersection_y2 > intersection_y1:
+                            intersection_area = (intersection_x2 - intersection_x1) * (intersection_y2 - intersection_y1)
+                            box_area = (x2 - x1) * (y2 - y1)
+                            box_yolo_area = (box_yolo_x2 - box_yolo_x1) * (box_yolo_y2 - box_yolo_y1)
+                            union_area = box_area + box_yolo_area - intersection_area
+                            iou = intersection_area / union_area if union_area > 0 else 0.0
+                            
+                            if iou > best_iou and iou > 0.3:  # 阈值0.3
+                                best_iou = iou
+                                best_mask_idx = j
+                    
+                    if best_mask_idx >= 0:
+                        # 将mask转换为uint8格式，并调整到图像尺寸
+                        mask_yolo = all_yolo_masks[best_mask_idx]
+                        h, w = color_image.shape[:2]
+                        if mask_yolo.shape != (h, w):
+                            # 如果mask尺寸不匹配，需要调整
+                            mask_yolo = cv2.resize(mask_yolo, (w, h), interpolation=cv2.INTER_NEAREST)
+                        mask_np = (mask_yolo * 255).astype(np.uint8)
+                    else:
+                        print(f"[分割] 候选框 {i} 未找到匹配的YOLOv8分割结果 (IoU阈值: 0.3)")
+                        continue
+                except Exception as e:
+                    print(f"[分割] 候选框 {i} YOLOv8分割失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+            else:
+                # 使用SAM分割
+                # 使用增强后的图像尺寸
+                sam_image_shape = image_rgb_for_sam.shape[:2]
+                boxes_tensor = torch.tensor([[x1, y1, x2, y2]], device=self.device)
+                transformed_boxes = self.sam_predictor.transform.apply_boxes_torch(boxes_tensor, sam_image_shape)
 
-            try:
-                masks, scores, logits = self.sam_predictor.predict_torch(
-                    point_coords=None,
-                    point_labels=None,
-                    boxes=transformed_boxes,
-                    multimask_output=False
-                )
-            except Exception as e:
-                print(f"[分割] 候选框 {i} 预测失败: {e}")
-                continue
+                try:
+                    masks, scores, logits = self.sam_predictor.predict_torch(
+                        point_coords=None,
+                        point_labels=None,
+                        boxes=transformed_boxes,
+                        multimask_output=False
+                    )
+                except Exception as e:
+                    print(f"[分割] 候选框 {i} 预测失败: {e}")
+                    continue
 
-            if masks.shape[0] == 0 or masks.shape[1] == 0:
-                print(f"[分割] 候选框 {i} 未生成掩码")
-                continue
+                if masks.shape[0] == 0 or masks.shape[1] == 0:
+                    print(f"[分割] 候选框 {i} 未生成掩码")
+                    continue
 
-            m_bool = masks[0][0].detach().cpu().numpy().astype(np.uint8)
-            mask_np = m_bool * 255
+                m_bool = masks[0][0].detach().cpu().numpy().astype(np.uint8)
+                mask_np = m_bool * 255
             # 限制在 bbox 内
             restricted_mask = np.zeros_like(mask_np, dtype=np.uint8)
             restricted_mask[y1:y2, x1:x2] = mask_np[y1:y2, x1:x2]
             mask_np = restricted_mask
 
-            # 计算点云并求质心深度（相机坐标系，单位米）
+            # 应用divide_mask优化mask，提取最大连通区域
+            try:
+                mask_np_refined = divide_mask(mask_np, verbose=False)
+                # 确保返回的mask格式一致（0/255）
+                if mask_np_refined.max() <= 1:
+                    mask_np_refined = mask_np_refined * 255
+                mask_np = mask_np_refined.astype(np.uint8)
+            except Exception as e:
+                # 如果优化失败，使用原始mask
+                if self.debug:
+                    print(f"[优化] 候选框 {i} mask优化失败，使用原始mask: {e}")
+
+            # 应用垂直腐蚀（如果启用）
+            if self.erode_bbox:
+                mask_np = self.erode_mask_vertical(mask_np)
+
+            # 使用2D质心+深度计算深度（相机坐标系，单位米）
             mask_bool = (mask_np > 0)
             if not np.any(mask_bool):
                 print(f"[分割] 候选框 {i} 掩码为空，跳过")
                 continue
 
-            points, colors = self.generate_pointcloud(color_image, depth_image, mask_bool)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          
-            if points is None or len(points) == 0:
-                print(f"[点云] 候选框 {i} 点云为空，跳过")
+            # 计算2D质心
+            try:
+                ys_mask, xs_mask = np.where(mask_bool)
+                if ys_mask.size == 0 or xs_mask.size == 0:
+                    print(f"[分割] 候选框 {i} 掩码为空，跳过")
+                    continue
+                
+                centroid_x_2d = int(np.mean(xs_mask))
+                centroid_y_2d = int(np.mean(ys_mask))
+                
+                # 确保坐标在图像范围内
+                h, w = depth_image.shape
+                centroid_x_2d = max(0, min(w - 1, centroid_x_2d))
+                centroid_y_2d = max(0, min(h - 1, centroid_y_2d))
+                
+                # 获取深度值（毫米）
+                depth_mm = depth_image[int(centroid_y_2d), int(centroid_x_2d)]
+                
+                if depth_mm > 0:
+                    # 转换为米
+                    depth_m = depth_mm / 1000.0
+                    print(f"候选框 {i} 2D质心: ({centroid_x_2d}, {centroid_y_2d}), 深度: {depth_m:.4f} m  bbox=({x1},{y1},{x2},{y2})")
+                else:
+                    print(f"[深度] 候选框 {i} 质心位置深度值为0，跳过")
+                    continue
+                    
+            except Exception as e:
+                print(f"[计算] 候选框 {i} 计算2D质心深度失败: {e}，跳过")
                 continue
-
-            centroid = np.mean(points, axis=0)  # (x,y,z) in meters (cam frame)
-            depth_m = float(centroid[2])
-            print(f"候选框 {i} 质心深度: {depth_m:.4f} m  bbox=({x1},{y1},{x2},{y2})")
 
             # 记录调试输出
             if self.debug:
@@ -418,10 +572,30 @@ class RealtimeSegmentation3D:
                 cv2.putText(det_vis, f"cand {i}", (x1, max(0, y1-5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
                 cv2.imwrite(os.path.join(self.detection_dir, f"{base_name}_cand{i}_box.png"), det_vis)
 
-            if depth_m < best_depth_m:
+            # Select best bbox based on bbox_selection strategy
+            should_update = False
+            if self.bbox_selection == "highest_confidence":
+                # Select bbox with highest confidence
+                if confidence > best_confidence:
+                    should_update = True
+            elif self.bbox_selection == "smallest":
+                # Select bbox with smallest area (closest depth)
+                if depth_m < best_depth_m:
+                    should_update = True
+            elif self.bbox_selection == "largest":
+                # Select bbox with largest area (farthest depth)
+                if depth_m > best_depth_m:
+                    should_update = True
+            else:
+                # Default: smallest depth (closest)
+                if depth_m < best_depth_m:
+                    should_update = True
+            
+            if should_update:
                 best_depth_m = depth_m
                 best_mask = mask_np
                 best_idx = i
+                best_confidence = confidence
 
         segmentation_time = time.time() - segmentation_start
         self.timers['segmentation'].append(segmentation_time)
@@ -430,8 +604,15 @@ class RealtimeSegmentation3D:
         if best_idx == -1 or best_mask is None:
             print("分割/点云均失败，未选出候选")
             return None, None
-
-        print(f"选择最近候选: idx={best_idx}, 深度={best_depth_m:.4f} m")
+        
+        if self.bbox_selection == "highest_confidence":
+            print(f"选择最高置信度候选: idx={best_idx}, 置信度={best_confidence:.3f}, 深度={best_depth_m:.4f} m")
+        elif self.bbox_selection == "smallest":
+            print(f"选择最近候选: idx={best_idx}, 深度={best_depth_m:.4f} m")
+        elif self.bbox_selection == "largest":
+            print(f"选择最远候选: idx={best_idx}, 深度={best_depth_m:.4f} m")
+        else:
+            print(f"选择最近候选: idx={best_idx}, 深度={best_depth_m:.4f} m")
 
         if best_depth_m > 0.8:
             print(f"深度超过0.8m，跳过")
@@ -506,6 +687,11 @@ class RealtimeSegmentation3D:
         valid_boxes = []
         for i, xyxy in enumerate(boxes_np):
             x1, y1, x2, y2 = [int(round(v)) for v in xyxy[:4].tolist()]
+            
+            # 应用边界框缩放（在YOLO检测后立即应用）
+            x1, y1, x2, y2 = self.scale_bbox(x1, y1, x2, y2, H, W)
+            
+            # 确保坐标在图像范围内（缩放后再次检查）
             x1 = max(0, min(x1, W - 1))
             y1 = max(0, min(y1, H - 1))
             x2 = max(0, min(x2, W - 1))
@@ -570,6 +756,136 @@ class RealtimeSegmentation3D:
     def apply_hand_eye_transform(self, points):
         """使用 util.apply_hand_eye_transform 应用手眼标定变换"""
         return util_apply_hand_eye_transform(points, self.hand_eye_transform)
+    
+    def pixel_to_3d_camera(self, u, v, depth_mm):
+        """
+        将2D像素坐标和深度值转换为3D相机坐标系坐标
+        
+        Args:
+            u: 像素x坐标
+            v: 像素y坐标
+            depth_mm: 深度值（毫米）
+        
+        Returns:
+            point_3d: 3D点坐标 (X, Y, Z) 单位：米（相机坐标系）
+        """
+        # 转换深度单位为米
+        z_m = depth_mm / 1000.0
+        
+        # 使用相机内参将像素坐标转换为3D坐标
+        # X = (u - cx) / fx * z
+        # Y = (v - cy) / fy * z
+        # Z = z
+        X = (u - self.cx) / self.fx * z_m
+        Y = (v - self.cy) / self.fy * z_m
+        Z = z_m
+        
+        return np.array([X, Y, Z], dtype=np.float32)
+    
+    def scale_bbox(self, x1, y1, x2, y2, image_height, image_width):
+        """
+        从中心点缩放边界框
+        
+        Args:
+            x1, y1, x2, y2: 原始边界框坐标
+            image_height: 图像高度
+            image_width: 图像宽度
+        
+        Returns:
+            scaled_x1, scaled_y1, scaled_x2, scaled_y2: 缩放后的边界框坐标
+        """
+        if self.bbox_scale == 1.0:
+            return x1, y1, x2, y2
+        
+        # 计算中心点和尺寸
+        center_x = (x1 + x2) / 2.0
+        center_y = (y1 + y2) / 2.0
+        width = x2 - x1
+        height = y2 - y1
+        
+        # 缩放尺寸
+        new_width = width * self.bbox_scale
+        new_height = height * self.bbox_scale
+        
+        # 计算新的边界框坐标
+        scaled_x1 = int(center_x - new_width / 2.0)
+        scaled_y1 = int(center_y - new_height / 2.0)
+        scaled_x2 = int(center_x + new_width / 2.0)
+        scaled_y2 = int(center_y + new_height / 2.0)
+        
+        # 裁剪到图像范围内
+        scaled_x1 = max(0, min(scaled_x1, image_width - 1))
+        scaled_y1 = max(0, min(scaled_y1, image_height - 1))
+        scaled_x2 = max(0, min(scaled_x2, image_width - 1))
+        scaled_y2 = max(0, min(scaled_y2, image_height - 1))
+        
+        # 确保 x2 > x1 和 y2 > y1
+        if scaled_x2 <= scaled_x1:
+            scaled_x2 = scaled_x1 + 1
+        if scaled_y2 <= scaled_y1:
+            scaled_y2 = scaled_y1 + 1
+        
+        if self.debug and self.bbox_scale != 1.0:
+            print(f"[缩放] 原始bbox: ({x1}, {y1}, {x2}, {y2}), 缩放后: ({scaled_x1}, {scaled_y1}, {scaled_x2}, {scaled_y2}), 缩放因子: {self.bbox_scale}")
+        
+        return scaled_x1, scaled_y1, scaled_x2, scaled_y2
+    
+    def erode_mask_vertical(self, mask):
+        """
+        对mask进行上下方向的腐蚀，去除边界区域以获得更精确的质心
+        
+        Args:
+            mask: 二值mask（numpy数组，0/255格式）
+        
+        Returns:
+            eroded_mask: 腐蚀后的mask
+        """
+        if not self.erode_bbox:
+            return mask
+        
+        try:
+            # 转换为二值格式（0/1）
+            mask_bool = (mask > 0).astype(np.uint8)
+            
+            # 找到mask的有效区域（非零区域）
+            ys, xs = np.where(mask_bool > 0)
+            if ys.size == 0 or xs.size == 0:
+                return mask
+            
+            y_min = int(ys.min())
+            y_max = int(ys.max())
+            height = y_max - y_min + 1
+            
+            # 计算上下各腐蚀的像素数
+            erode_pixels = int(height * self.erode_ratio)
+            
+            if erode_pixels > 0 and height > erode_pixels * 2:
+                # 创建腐蚀后的mask
+                eroded_mask = np.zeros_like(mask_bool)
+                
+                # 只保留中间部分（去除上下各10%）
+                y_start = y_min + erode_pixels
+                y_end = y_max - erode_pixels + 1
+                
+                # 复制中间部分
+                eroded_mask[y_start:y_end, :] = mask_bool[y_start:y_end, :]
+                
+                # 转换回0/255格式
+                eroded_mask = eroded_mask.astype(np.uint8) * 255
+                
+                if self.debug:
+                    print(f"[腐蚀] 原始高度: {height}, 腐蚀像素: {erode_pixels}, 保留高度: {y_end - y_start}")
+                
+                return eroded_mask
+            else:
+                # 如果mask太小，不进行腐蚀
+                if self.debug:
+                    print(f"[腐蚀] Mask太小（高度={height}），跳过腐蚀")
+                return mask
+                
+        except Exception as e:
+            print(f"[腐蚀] 腐蚀mask失败: {e}，返回原始mask")
+            return mask
 
     def _rpy_to_rotation_matrix(self, rx, ry, rz):
         # 保留兼容方法但委托到 util（如后续直接调用 util，可删除此方法）
@@ -687,10 +1003,14 @@ class RealtimeSegmentation3D:
         """
         print("开始实时处理...")
         print("按 'q' 键停止")
+        print("按空格键暂停/继续")
         if self.fish_tracker is not None:
             print("按 'r' 键重置容器")
             print("按 's' 键显示状态")
             print("按 'e' 键导出数据")
+        
+        # 暂停标志
+        paused = False
         
         # 验证相机连接
         print("[调试] 开始验证相机连接...")
@@ -732,13 +1052,17 @@ class RealtimeSegmentation3D:
 
         try:
             tcp_result = self.robot.get_tcp_position()
+            joint_result = self.robot.get_joint_position()
+            original_joint = []
             if isinstance(tcp_result, tuple) and len(tcp_result) == 2:
                 tcp_ok, original_tcp = tcp_result
+                original_joint =  joint_result[1]
             else:
                 # 如果只返回一个值，假设它是位置信息
                 original_tcp = tcp_result
                 tcp_ok = True
             print(f"[调试] TCP位置获取成功: {original_tcp}")
+            print(f"[调试] Joint位置获取成功: {original_joint}")
         except Exception as e:
             print(f"[错误] 获取TCP位置失败: {e}")
             import traceback
@@ -806,6 +1130,32 @@ class RealtimeSegmentation3D:
             
         try:
             while True:
+                # 处理键盘输入（包括暂停状态下的输入）
+                if show_preview:
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord(' '):  # 空格键
+                        paused = not paused
+                        if paused:
+                            print("⏸️  已暂停 - 按空格键继续")
+                        else:
+                            print("▶️  已继续")
+                    elif key == ord('q'):
+                        print("用户按 'q' 键停止")
+                        break
+                    elif key == ord('r') and self.fish_tracker is not None:
+                        print("用户按 'r' 键重置容器")
+                        self.fish_tracker.reset_container(confirm=True)
+                    elif key == ord('s') and self.fish_tracker is not None:
+                        print("用户按 's' 键显示状态")
+                        self.fish_tracker.print_status()
+                    elif key == ord('e') and self.fish_tracker is not None:
+                        print("用户按 'e' 键导出数据")
+                        self.fish_tracker.export_data()
+                
+                # 如果暂停，跳过处理但继续监听键盘
+                if paused:
+                    continue
+                
                 # 整个循环计时开始
                 cycle_start = time.time()
                 
@@ -854,7 +1204,7 @@ class RealtimeSegmentation3D:
                 if mask_vis is not None:
                     # 重新运行检测以获取边界框可视化
                     #if getattr(self, 'use_yolo', False):
-                    boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.25, iou=0.45, imgsz=640)
+                    boxes = self.detect_yolo(color_image, self.yolo_weights, conf=0.6, iou=0.45, imgsz=640)
                   
                     if boxes:
                         detection_vis = color_image.copy()
@@ -906,16 +1256,44 @@ class RealtimeSegmentation3D:
                     except Exception:
                         landmark_vis = None
                 
-                # 在landmark_vis上绘制质心十字标记
-                if landmark_vis is not None and mask_vis is not None:
+                # 应用垂直腐蚀（如果启用）- 对最终选择的mask进行腐蚀
+                mask_vis_eroded = mask_vis
+                if mask_vis is not None and self.erode_bbox:
+                    mask_vis_eroded = self.erode_mask_vertical(mask_vis.copy())
+                
+                # 计算2D质心（用于后续3D转换）
+                centroid_2d = None
+                if mask_vis_eroded is not None:
                     try:
-                        # 计算掩码的质心
-                        ys, xs = np.where(mask_vis > 0)
+                        # 计算掩码的质心（使用腐蚀后的mask）
+                        ys, xs = np.where(mask_vis_eroded > 0)
                         if ys.size > 0 and xs.size > 0:
                             centroid_x = int(np.mean(xs))
                             centroid_y = int(np.mean(ys))
-                            
-                            # 绘制十字标记
+                            centroid_2d = (centroid_x, centroid_y)
+                    except Exception as e:
+                        print(f"[计算] 计算2D质心失败: {e}")
+                
+                # 在landmark_vis上绘制质心和抓取点标记
+                if landmark_vis is not None:
+                    try:
+                        # 如果使用centroid模式，尝试计算并显示抓取点
+                        grasp_point_2d_vis = None
+                        if self.grasp_point_mode == "centroid" and mask_vis is not None:
+                            try:
+                                _, _, _, grasp_point_2d_vis = estimate_body_angle_and_grasp_point(
+                                    mask_vis > 0, 
+                                    return_details=True,
+                                    debug=False,  # 预览时不保存调试图像
+                                    debug_output_path=None
+                                )
+                            except Exception as e:
+                                # 预览时计算失败不影响主流程
+                                pass
+                        
+                        # 绘制质心十字标记（黄色）
+                        if centroid_2d is not None:
+                            centroid_x, centroid_y = centroid_2d
                             cross_size = 25
                             cross_thickness = 4
                             cross_color = (0, 255, 255)  # 黄色 (BGR)
@@ -930,31 +1308,56 @@ class RealtimeSegmentation3D:
                                    (centroid_x, centroid_y - cross_size), 
                                    (centroid_x, centroid_y + cross_size), 
                                    cross_color, cross_thickness)
+                        
+                        # 绘制抓取点标记（红色，如果计算成功）
+                        if grasp_point_2d_vis is not None:
+                            grasp_x, grasp_y = int(round(grasp_point_2d_vis[0])), int(round(grasp_point_2d_vis[1]))
+                            # 绘制红色圆圈和十字
+                            cv2.circle(landmark_vis, (grasp_x, grasp_y), 8, (0, 0, 255), -1)  # 红色填充圆
+                            cv2.circle(landmark_vis, (grasp_x, grasp_y), 12, (0, 0, 255), 2)  # 红色外圈
+                            # 十字标记
+                            cross_size_grasp = 15
+                            cv2.line(landmark_vis, 
+                                   (grasp_x - cross_size_grasp, grasp_y), 
+                                   (grasp_x + cross_size_grasp, grasp_y), 
+                                   (255, 255, 255), 2)  # 白色十字
+                            cv2.line(landmark_vis, 
+                                   (grasp_x, grasp_y - cross_size_grasp), 
+                                   (grasp_x, grasp_y + cross_size_grasp), 
+                                   (255, 255, 255), 2)  # 白色十字
                     except Exception as e:
-                        print(f"[可视化] 绘制质心标记失败: {e}")
+                        print(f"[可视化] 绘制标记失败: {e}")
                 
                 # 显示预览窗口
                 self.show_preview(color_image, depth_image, mask_vis, detection_vis, landmark_vis)
                 
-                # 确保窗口显示并处理按键
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    print("用户按 'q' 键停止")
-                    break
-                elif key == ord('r') and self.fish_tracker is not None:
-                    print("用户按 'r' 键重置容器")
-                    self.fish_tracker.reset_container(confirm=True)
-                elif key == ord('s') and self.fish_tracker is not None:
-                    print("用户按 's' 键显示状态")
-                    self.fish_tracker.print_status()
-                elif key == ord('e') and self.fish_tracker is not None:
-                    print("用户按 'e' 键导出数据")
-                    self.fish_tracker.export_data()
+                # 确保窗口显示并处理按键（非暂停状态下的额外按键处理）
+                if show_preview:
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord(' '):  # 空格键
+                        paused = not paused
+                        if paused:
+                            print("⏸️  已暂停 - 按空格键继续")
+                        else:
+                            print("▶️  已继续")
+                    elif key == ord('q'):
+                        print("用户按 'q' 键停止")
+                        break
+                    elif key == ord('r') and self.fish_tracker is not None:
+                        print("用户按 'r' 键重置容器")
+                        self.fish_tracker.reset_container(confirm=True)
+                    elif key == ord('s') and self.fish_tracker is not None:
+                        print("用户按 's' 键显示状态")
+                        self.fish_tracker.print_status()
+                    elif key == ord('e') and self.fish_tracker is not None:
+                        print("用户按 'e' 键导出数据")
+                        self.fish_tracker.export_data()
 
                 # 根据掩码生成3D点云并保存（可选应用手眼标定）
+                # 注意：现在主要用于可视化，3D质心计算改为使用2D质心+深度
                 points_gripper = None  # 初始化变量
                 if mask_vis is not None and base_name is not None:
-                    # 点云生成计时
+                    # 点云生成计时（仅用于可视化，不用于质心计算）
                     pointcloud_start = time.time()
                     mask_bool = (mask_vis > 0)
                     points, colors = self.generate_pointcloud(color_image, depth_image, mask_bool)
@@ -966,19 +1369,19 @@ class RealtimeSegmentation3D:
                         points_gripper = self.apply_hand_eye_transform(points)
                         
                         # 保存点云（仅在debug模式下）
-                        if self.debug:
-                            # 保存相机坐标系点云
-                            cam_ply = os.path.join(self.pointcloud_dir, f"{base_name}_cam_pointcloud.ply")
-                            save_pointcloud_to_file(points, colors, cam_ply)
-                            # 保存夹爪坐标系点云
-                            grip_ply = os.path.join(self.pointcloud_dir, f"{base_name}_gripper_pointcloud.ply")
-                            save_pointcloud_to_file(points_gripper, colors, grip_ply)
+                        # if self.debug:
+                        #     # 保存相机坐标系点云
+                        #     # cam_ply = os.path.join(self.pointcloud_dir, f"{base_name}_cam_pointcloud.ply")
+                        #     # save_pointcloud_to_file(points, colors, cam_ply)
+                        #     # 保存夹爪坐标系点云
+                        #     grip_ply = os.path.join(self.pointcloud_dir, f"{base_name}_gripper_pointcloud.ply")
+                        #     save_pointcloud_to_file(points_gripper, colors, grip_ply)
                 
                 # don't forget to transform the units, the point cloud is in meter, but robot
                 # control would like to be in mm. 
 
-                # 计算点云质心和法向量（在夹爪坐标系中）
-                if points_gripper is not None and len(points_gripper) > 0:
+                # 使用2D质心+深度计算3D质心（在夹爪坐标系中）
+                if centroid_2d is not None and mask_vis is not None:
                     # 抓取点计算计时
                     grasp_calc_start = time.time()
                     
@@ -1102,52 +1505,91 @@ class RealtimeSegmentation3D:
                         except Exception as e:
                             print(f"[AI] 预测身体中心失败，回退质心: {e}")
 
-                    # 若AI未生成移动，使用质心点云方案
+                    # 若AI未生成移动，使用新的抓取点计算方案（基于PCA的抓取点）
                     if relative_move is None:
-                        # 质心点（夹爪系）
-                        centroid = np.mean(points_gripper, axis=0)
-                        print(f"夹爪坐标系点云质心: {centroid}")
-                        
-                        # 将质心沿着主方向移动5mm
                         try:
-                            if len(points_gripper) > 10:
-                                # 使用点云在XY平面的投影计算主方向
-                                points_xy = points_gripper[:, :2]  # 只取XY坐标（米）
-                                points_centered = points_xy - points_xy.mean(axis=0)
+                            # 使用新的抓取点计算函数
+                            grasp_point_2d = None
+                            if mask_vis is not None:
+                                # 计算抓取点（2D像素坐标）
+                                debug_output_path = None
+                                if hasattr(self, 'debug') and self.debug:
+                                    # 生成调试输出路径
+                                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+                                    debug_output_path = os.path.join(self.output_dir, f"grasp_point_debug_{timestamp}")
                                 
-                                # SVD计算主方向
-                                U, S, Vt = np.linalg.svd(points_centered, full_matrices=False)
-                                dir_xy = Vt[0, :]  # 主方向向量 (dx, dy)，单位向量
+                                try:
+                                    _, _, _, grasp_point_2d = estimate_body_angle_and_grasp_point(
+                                        mask_vis > 0, 
+                                        return_details=True,
+                                        debug=hasattr(self, 'debug') and self.debug,
+                                        debug_output_path=debug_output_path
+                                    )
+                                    if grasp_point_2d is not None:
+                                        print(f"🎯 计算得到抓取点(2D): ({grasp_point_2d[0]:.1f}, {grasp_point_2d[1]:.1f})")
+                                except Exception as e:
+                                    print(f"⚠️ 计算抓取点失败: {e}")
+                            
+                            # 如果抓取点计算失败，回退到2D质心
+                            if grasp_point_2d is None:
+                                if centroid_2d is not None:
+                                    grasp_point_2d = (float(centroid_2d[0]), float(centroid_2d[1]))
+                                    print(f"⚠️ 抓取点计算失败，回退到2D质心: ({grasp_point_2d[0]:.1f}, {grasp_point_2d[1]:.1f})")
+                                else:
+                                    print("⚠️ 错误: 无法获取抓取点或质心，跳过此目标")
+                                    continue
+                            
+                            # 确保坐标在图像范围内
+                            h, w = depth_image.shape
+                            grasp_x = max(0, min(w - 1, int(round(grasp_point_2d[0]))))
+                            grasp_y = max(0, min(h - 1, int(round(grasp_point_2d[1]))))
+                            
+                            # 获取深度值（毫米）
+                            depth_mm = depth_image[grasp_y, grasp_x]
+                            
+                            if depth_mm > 0:
+                                # 将2D抓取点+深度转换为3D相机坐标
+                                grasp_camera = self.pixel_to_3d_camera(grasp_x, grasp_y, depth_mm)
+                                print(f"2D抓取点: ({grasp_x}, {grasp_y}), 深度: {depth_mm:.1f}mm")
+                                print(f"相机坐标系3D抓取点: {grasp_camera}")
                                 
-                                # 确保方向一致性：选择指向正X方向的方向
-                                if dir_xy[0] < 0:
-                                    dir_xy = -dir_xy
+                                # 应用手眼标定转换到夹爪坐标系
+                                # 需要将单个点转换为点数组格式
+                                grasp_camera_array = grasp_camera.reshape(1, 3)
+                                grasp_gripper_array = self.apply_hand_eye_transform(grasp_camera_array)
+                                grasp_gripper = grasp_gripper_array[0]  # 提取单个点
                                 
-                                # 将质心沿着主方向移动5mm（0.005米）
-                                offset_m = 0.0025 # 5mm
-                                centroid_offset = centroid.copy()
-                                centroid_offset[0] += dir_xy[0] * offset_m
-                                centroid_offset[1] += dir_xy[1] * offset_m
-                                # Z坐标保持不变
+                                print(f"夹爪坐标系3D抓取点: {grasp_gripper}")
                                 
-                                print(f"📐 主方向向量: ({dir_xy[0]:.4f}, {dir_xy[1]:.4f})")
-                                print(f"📍 移动前质心: {centroid}")
-                                print(f"📍 移动后质心（沿主方向+5mm）: {centroid_offset}")
-                                
-                                center_gripper_mm = centroid_offset * 1000
+                                # 转换为毫米
+                                center_gripper_mm = grasp_gripper * 1000.0
                             else:
-                                # 如果点云太少，使用原始质心
-                                print("⚠️ 点云点数太少，使用原始质心")
-                                center_gripper_mm = centroid * 1000
+                                print(f"⚠️ 警告: 2D抓取点位置深度值为0，无法计算3D抓取点")
+                                # 如果深度无效，回退到点云质心（如果可用）
+                                if points_gripper is not None and len(points_gripper) > 0:
+                                    centroid = np.mean(points_gripper, axis=0)
+                                    print(f"回退到点云质心: {centroid}")
+                                    center_gripper_mm = centroid * 1000.0
+                                else:
+                                    print("⚠️ 错误: 无法计算3D抓取点，跳过此目标")
+                                    continue
                         except Exception as e:
-                            # 如果计算失败，使用原始质心
-                            print(f"⚠️ 计算主方向失败: {e}，使用原始质心")
-                            center_gripper_mm = centroid * 1000
+                            print(f"⚠️ 计算2D抓取点到3D转换失败: {e}")
+                            import traceback
+                            traceback.print_exc()
+                            # 如果转换失败，回退到点云质心（如果可用）
+                            if points_gripper is not None and len(points_gripper) > 0:
+                                centroid = np.mean(points_gripper, axis=0)
+                                print(f"回退到点云质心: {centroid}")
+                                center_gripper_mm = centroid * 1000.0
+                            else:
+                                print("⚠️ 错误: 无法计算3D抓取点，跳过此目标")
+                                continue
                         
                         delta_tool_mm = [center_gripper_mm[0], center_gripper_mm[1], center_gripper_mm[2]]
                         delta_base_xyz = self._tool_offset_to_base(delta_tool_mm, current_tcp[3:6])
                         z_offset = -delta_tool_mm[2]
-                        relative_move = [delta_base_xyz[0], delta_base_xyz[1], z_offset, 0, 0, 0]
+                        relative_move = [delta_base_xyz[0], delta_base_xyz[1], z_offset -5, 0, 0, 0]
                         
                         # 在质心模式下，确保alpha_1的方向一致性
                         # PCA可能返回两个相反的方向，导致角度不一致（有时旋转90度）
@@ -1187,6 +1629,23 @@ class RealtimeSegmentation3D:
                     self.timers['grasp_calculation'].append(grasp_calc_time)
                     print(f"⏱️  grasp_calculation: {grasp_calc_time:.3f}s")
                     
+
+                    # 执行相对移动
+                    fish_count += 1
+                    counter = rows * cols
+                    if counter <= 0:
+                        print(f"[错误] 无效的网格配置: rows={rows}, cols={cols}, counter={counter}")
+                        counter = len(fish_path_json) if fish_path_json else 1
+                        print(f"[警告] 使用路径文件数量作为计数器: {counter}")
+                    fish_count = ((fish_count - 1) % counter) + 1  # 确保 fish_count 在 1 到 counter 之间
+                    print(f"[调试] fish_count={fish_count}, counter={counter}, rows={rows}, cols={cols}")
+
+                    if fish_count == 1:
+                        continue
+
+                    if fish_count == 6:
+                        continue
+
                     print("Step1 : 准备抓取")
                     print("相对移动量:", relative_move)
                     
@@ -1204,24 +1663,29 @@ class RealtimeSegmentation3D:
                     self.robot.joint_move([0,0,0,0,0,np.pi/2-alpha_1], 1, True, 1)
                     time.sleep(0.5)
                     
-                    # 执行相对移动
-                    fish_count += 1
-                    counter = rows * cols
-                    if counter <= 0:
-                        print(f"[错误] 无效的网格配置: rows={rows}, cols={cols}, counter={counter}")
-                        counter = len(fish_path_json) if fish_path_json else 1
-                        print(f"[警告] 使用路径文件数量作为计数器: {counter}")
-                    fish_count = ((fish_count - 1) % counter) + 1  # 确保 fish_count 在 1 到 counter 之间
-                    print(f"[调试] fish_count={fish_count}, counter={counter}, rows={rows}, cols={cols}")
-
-                    self.robot.set_digital_output(0, 0, 1)
-
                     # catch fish
                     ret = self.robot.linear_move([relative_move[0], relative_move[1], 0, 0, 0, 0], 1, True, 100)
+                    self.robot.set_digital_output(0, 0, 1)
+
                     ret = self.robot.linear_move([0, 0, relative_move[2], 0, 0, 0], 1, True, 100)
+
+                    if fish_count == 5 or fish_count == 10:
+                        relative_move[1] = float(relative_move[1]-50)
+
+                    time.sleep(0.3)
                   
+                    #ret = self.robot.linear_move(original_tcp, 0, True, 100)
+
                     # go back to original point
-                    self.robot.linear_move(original_tcp, 0 , True, 40)
+                    #self.robot.joint_move([0,0,0,0,0,-np.pi/2+alpha_1], 1, True, 1)
+                    ret = self.robot.linear_move(original_tcp, 0, True, 100)
+
+                    rotation_flag = 1 if alpha_1_raw > 0 else -1 
+                    print("-----------------------------------------------------------")
+                    print("rotation_flag : {}".format(rotation_flag))
+                    ret = self.robot.joint_move([0,0,0,0,0,-np.pi/2 * rotation_flag],1, False,50)
+
+                    time.sleep(0.2)
                     
                     # get target point1
                     fish_key = str(fish_count)
@@ -1253,9 +1717,9 @@ class RealtimeSegmentation3D:
                     self.robot.set_digital_output(0,1,0)
                     ret = self.robot.linear_move([0, -joint_pos2[1], 200, 0, 0, 0], 1 , True, 400)
                     
-                    self.robot.linear_move(original_tcp, 0 , True, 200)
+                    self.robot.linear_move(original_tcp, 0, True, 200)
                     
-                    time.sleep(1)
+                    time.sleep(0.3)
                     
                     robot_movement_time = time.time() - robot_movement_start
                     self.timers['robot_movement'].append(robot_movement_time)
@@ -1337,6 +1801,17 @@ def main():
                       help='手眼标定JSON文件路径，包含 hand_eye.R 和 hand_eye.t')
     parser.add_argument('--robot_config', type=str, default='configs/robot.json',
                       help='机器人配置文件，包含初始位姿 (默认: configs/robot.json)')
+    parser.add_argument('--erode_bbox', action='store_true',
+                      help='对检测到的mask进行上下方向腐蚀，去除边界区域以获得更精确的质心计算')
+    parser.add_argument('--erode_ratio', type=float, default=0.1,
+                      help='腐蚀比例，上下各腐蚀的比例（默认0.1，即10%%）')
+    parser.add_argument('--bbox_scale', type=float, default=1.0,
+                      help='边界框缩放因子（默认1.0，即不缩放；>1.0放大，<1.0缩小）')
+    parser.add_argument('--seg_model', type=str, default='sam',
+                      choices=['sam', 'yolov8_seg'],
+                      help='分割模型类型: sam(默认) 或 yolov8_seg')
+    parser.add_argument('--yolo_seg_weights', type=str, default=None,
+                      help='YOLOv8分割模型权重路径(.pt)，当 --seg_model=yolov8_seg 时必需')
     
     args = parser.parse_args()
     
@@ -1358,7 +1833,12 @@ def main():
             max_container_weight=args.max_container_weight,
             det_gray=args.det_gray,
             camera_calib_json=args.camera_calib_json,
-            robot_config=args.robot_config
+            robot_config=args.robot_config,
+            erode_bbox=args.erode_bbox,
+            erode_ratio=args.erode_ratio,
+            bbox_scale=args.bbox_scale,
+            seg_model=args.seg_model,
+            yolo_seg_weights=args.yolo_seg_weights
         )
         # 运行实时处理
         processor.run_realtime(
